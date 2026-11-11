@@ -4,7 +4,7 @@ Nautilus
 
 ---
 
-<img src="images/powershell.png" alt="image" width="1000">
+<img src="images/banner.png" alt="image" width="1200">
 
 </h1> 
 
@@ -98,9 +98,6 @@ Building within pure performance for both low-end and high-end PCs, makes the pr
 - VBSCRIPT
 
 #### CBS Package
-- Edge (Edge, EdgeUpdate, EdgeCore)
-- Microsoft-Edge-Webview
-- OneDrive
 - Microsoft-Copilot-Package
 - Microsoft-Windows-CEIPEnable-Adm-Package
 - Microsoft-Windows-FlipGridPWA-Package
@@ -114,6 +111,11 @@ Building within pure performance for both low-end and high-end PCs, makes the pr
 - UserExperience-AIX-Package
 - LanguageFeatures-TextToSpeech
 - UserExperience-Recall-Package
+
+#### And more...
+- Edge (Edge, EdgeUpdate, EdgeCore)
+- Microsoft-Edge-Webview
+- OneDrive
 
 ## Tweaks
 - Telemetry, sponsors apps
