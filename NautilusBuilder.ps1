@@ -474,7 +474,7 @@ foreach ($Path in $OneDrivePaths) {
     }
 }
 
-Write-Host "`n[5/15] Unlocking DMA Region Policy & Purging Optional Features..." -ForegroundColor Yellow
+Write-Host "`n[6/15] Unlocking DMA Region Policy & Purging Optional Features..." -ForegroundColor Yellow
 
 $DmaPolicyJson = "$MountDir\Windows\System32\IntegratedServicesRegionPolicySet.json"
 if (Test-Path $DmaPolicyJson) {
@@ -512,7 +512,7 @@ foreach ($FeatName in $OptionalFeatures) {
     }
 }
 
-Write-Host "`n[6/15] Removing Windows Capabilities (FOD)..." -ForegroundColor Yellow
+Write-Host "`n[7/15] Removing Windows Capabilities (FOD)..." -ForegroundColor Yellow
 
 $CapabilityPatterns = @(
     "App.StepsRecorder*",
@@ -553,7 +553,7 @@ foreach ($Cap in $CurrentCapabilities) {
 }
 
 # Phase 8: Removing SystemPackages
-Write-Host "`n[7/15] Unlocking Hidden CBS Packages & Deep Cleaning via DISM..." -ForegroundColor Yellow
+Write-Host "`n[8/15] Unlocking Hidden CBS Packages & Deep Cleaning via DISM..." -ForegroundColor Yellow
 
 $CbsTargetPatterns = @(
     "*OneDrive-Setup*",
@@ -634,7 +634,7 @@ if (Test-Path $AssocFile) {
 }
 
 # Phase 9: Registry"ing"
-Write-Host "`n[8/15] Applying bypassing requirements & registry..." -ForegroundColor Yellow
+Write-Host "`n[9/15] Applying bypassing requirements & registry..." -ForegroundColor Yellow
 try {
     reg load HKLM\zCOMPONENTS "$MountDir\Windows\System32\config\COMPONENTS" | Out-Null
     reg load HKLM\zDEFAULT "$MountDir\Windows\System32\config\default" | Out-Null
@@ -803,7 +803,7 @@ finally {
 }
 
 # Phase 10: Driver Injection
-Write-Host "`n[9/15] Injecting full hardware drivers into install.wim..." -ForegroundColor Yellow
+Write-Host "`n[10/15] Injecting full hardware drivers into install.wim..." -ForegroundColor Yellow
 if ($UseDriverInjection) {
     $InfCount = (Get-ChildItem -Path $DriverFolder -Recurse -Filter "*.inf" -File -ErrorAction SilentlyContinue | Measure-Object).Count
     if ($InfCount -gt 0) {
@@ -814,7 +814,7 @@ if ($UseDriverInjection) {
 }
 
 # Phase 11: ResetBase
-Write-Host "`n[10/15] Deep cleaning image components (ResetBase)..." -ForegroundColor Yellow
+Write-Host "`n[11/15] Deep cleaning image components (ResetBase)..." -ForegroundColor Yellow
 
 Write-Host "  - [DISM] Disabling Reserved Storage..." -ForegroundColor DarkGray
 dism.exe /Image:"$MountDir" /Set-ReservedStorageState /State:Disabled /Quiet | Out-Null
@@ -834,7 +834,7 @@ Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\Download\*" -Recurse -
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\DataStore\*" -Recurse -Force -ErrorAction SilentlyContinue
 
 # Phase 12: Saving & Exporting
-Write-Host "`n[11/15] Saving changes to install.$InstallSystem..." -ForegroundColor Yellow
+Write-Host "`n[12/15] Saving changes to install.$InstallSystem..." -ForegroundColor Yellow
 dism.exe /Unmount-Image /MountDir:"$MountDir" /Commit | Out-Null
 
 Write-Host "`n[!] Compression mode selected:" -ForegroundColor Cyan
@@ -857,7 +857,7 @@ Rename-Item -Path $OptimizedFile -NewName "install.$DestExt"
 $InstallSystem = $DestExt
 
 # Phase 13: Bypass
-Write-Host "`n[12/15] Mounting boot.wim (Index 2) for Hardware Bypass & Storage Drivers..." -ForegroundColor Yellow
+Write-Host "`n[13/15] Mounting boot.wim (Index 2) for Hardware Bypass & Storage Drivers..." -ForegroundColor Yellow
 dism.exe /Mount-Image /ImageFile:"$ExtractDir\sources\boot.wim" /Index:2 /MountDir:"$MountDir" /Optimize
 
 if ($UseDriverInjection -and (Test-Path $BootDriverFolder)) {
@@ -884,11 +884,11 @@ try {
     reg unload HKLM\zSYSTEM 2>$null | Out-Null
 }
 
-Write-Host "`n[13/15] Saving changes to boot.wim..." -ForegroundColor Yellow
+Write-Host "`n[14/15] Saving changes to boot.wim..." -ForegroundColor Yellow
 dism.exe /Unmount-Image /MountDir:"$MountDir" /Commit
 
-# Phase 13: Autounattend.xml
-Write-Host "`n[13/14] Generating autounattend.xml..." -ForegroundColor Yellow
+# Phase 14: Autounattend.xml
+Write-Host "`n[15/15] Generating autounattend.xml..." -ForegroundColor Yellow
 $XmlContent = @"
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -932,29 +932,33 @@ $XmlContent = @"
 "@
 $XmlContent | Out-File -FilePath "$ExtractDir\autounattend.xml" -Encoding UTF8
 
-# Phase 14: Creating ISO files
-Write-Host "`n[14/14] ISO Creation Process..." -ForegroundColor Yellow
+# Phase 15: Creating ISO files
+Write-Host "ISO Creation Process..." -ForegroundColor Yellow
 
-$OscdimgPath = "$Workspace\oscdimg.exe"
+$OscdimgPath = Get-OscdimgPath
 $MicrosoftUrl = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
 
-if (!(Test-Path $OscdimgPath)) {
-    Write-Host "-> Cannot find oscdimg, downloading securely from Microsoft..." -ForegroundColor Cyan
+if (-not $OscdimgPath) {
+    $OscdimgPath = "$Workspace\oscdimg.exe"
+    Write-Host "-> oscdimg not found locally, scanning runtime environment and preparing download..." -ForegroundColor Cyan
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $MicrosoftUrl -OutFile $OscdimgPath -UseBasicParsing
-        Write-Host "-> Completed!" -ForegroundColor Green
+        Write-Host "-> Download completed successfully." -ForegroundColor Green
     } catch {
-        Write-Host "-> Error: Cannot download tool!" -ForegroundColor Red
+        Write-Host "-> Error: Cannot download oscdimg.exe. Please install Windows ADK or check your internet connection." -ForegroundColor Red
+        Exit
     }
+} else {
+    Write-Host "-> oscdimg found: $OscdimgPath" -ForegroundColor Green
 }
 
 if (Test-Path $OscdimgPath) {
     Write-Host "Building ISO... (Please wait)" -ForegroundColor Cyan
     $BuildArgs = "-m -o -u2 -udfver102 -bootdata:2#p0,e,b`"$ExtractDir\boot\etfsboot.com`"#pEF,e,b`"$ExtractDir\efi\microsoft\boot\efisys.bin`" `"$ExtractDir`" `"$FinalISO`""
-    
+
     Start-Process -FilePath $OscdimgPath -ArgumentList $BuildArgs -Wait -NoNewWindow
-    
+
     Write-Host "`nCompleted! Your ISO is ready at: $FinalISO" -ForegroundColor Green
     Write-Host "Cleaning up workspace..." -ForegroundColor DarkGray
     Remove-Item -Path $Workspace -Recurse -Force
