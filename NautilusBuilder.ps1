@@ -553,41 +553,86 @@ foreach ($Cap in $CurrentCapabilities) {
 }
 
 # Phase 8: Removing SystemPackages
-Write-Host "`n[7/14] Removing system packages..." -ForegroundColor Yellow
+Write-Host "`n[7/15] Unlocking Hidden CBS Packages & Deep Cleaning via DISM..." -ForegroundColor Yellow
 
-$PackagePatterns = @(
-    "*InternetExplorer-Optional*",
-    "*LanguageFeatures-Handwriting*",
-    "*LanguageFeatures-OCR*",
-    "*LanguageFeatures-Speech*",
-    "*LanguageFeatures-TextToSpeech*",
-    "*MediaPlayer*",
+$CbsTargetPatterns = @(
+    "*OneDrive-Setup*",
     "*OneDrive-Setup-Package*",
-    "*PowerShell-ISE-FOD*",
-    "*QuickAssist-*",
+    "*Internet-Browser-Package*",
+    "*InternetExplorer-Optional*",
+    "*InternetExplorer*",
+    "*QuickAssist*",
     "*StepsRecorder*",
     "*TabletPCMath*",
     "*Wallpaper-Content-Extended*",
-    "*WordPad-FoD*"
+    "*WordPad*",
+    "*RemoteAssistance*",
+    "*Printing-XPSServices*",
+    "*Printing-XpsDocumentWriter*",
+    "*FaxServices*",
+    "*ContactSupport*",
+    "*WorkFolders*",
+    "*RetailDemo*",
+    "*Windows-AI-Copilot*",
+    "*Microsoft-Copilot-Package*",
+    "*UserExperience-AIX-Package*",
+    "*UserExperience-Recall-Package*",
+    "*FlipGridPWA*",
+    "*OutlookPWA*",
+    "*CEIPEnable*",
+    "*Recall*"
 )
 
-Write-Host "  - Scanning system packages..." -ForegroundColor DarkGray
-$DismPackagesOutput = dism.exe /Image:"$MountDir" /Get-Packages /English
-
-$AllPackageNames = $DismPackagesOutput | Select-String "Package Identity : " | ForEach-Object {
-    $_.Line.Replace("Package Identity : ", "").Trim()
+if ($AggressiveDebloat -eq "Y") {
+    $CbsTargetPatterns += @(
+        "*LanguageFeatures-Handwriting*",
+        "*LanguageFeatures-OCR*",
+        "*LanguageFeatures-Speech*",
+        "*LanguageFeatures-TextToSpeech*",
+        "*MediaPlayer*",
+        "*PowerShell-ISE*",
+        "*OpenSSH-Server*",
+        "*Application-Experience*",
+        "*Customer-Experience-Improvement*",
+        "*Windows-Error-Reporting*"
+    )
 }
 
-foreach ($Pattern in $PackagePatterns) {
-    $PackagesToRemove = $AllPackageNames | Where-Object { $_ -like $Pattern }
-    
-    if ($PackagesToRemove) {
-        foreach ($Pkg in $PackagesToRemove) {
-            Write-Host "  - Removed $Pkg" -ForegroundColor DarkGray
-            dism.exe /Image:"$MountDir" /Remove-Package /PackageName:"$Pkg" /Quiet /NoRestart | Out-Null
+Write-Host "  - Unlocking CBS Registry locks (Visibility & Owners) for target packages..." -ForegroundColor Cyan
+Unlock-OfflineCbsPackages -MountPath $MountDir -TargetPatterns $CbsTargetPatterns
+
+Write-Host "  - Querying unlocked CBS packages (Installed & Staged) via DISM..." -ForegroundColor DarkGray
+$UnlockedPackages = Get-WindowsPackage -Path $MountDir -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.PackageState -in @("Installed", "Staged") -and
+        $_.PackageName -notlike "Package_for_RollupFix*" -and
+        $_.PackageName -notlike "Package_for_ServicingStack*" -and
+        $_.PackageName -notlike "Package_for_DotNetRollup*" -and
+        $_.PackageName -notlike "Package_for_KB*"
+    }
+
+foreach ($Pkg in $UnlockedPackages) {
+    foreach ($Pattern in $CbsTargetPatterns) {
+        if ($Pkg.PackageName -like $Pattern) {
+            Write-Host "  - [DISM CBS] Purging $($Pkg.PackageState) package: $($Pkg.PackageName)" -ForegroundColor DarkGray
+            dism.exe /Image:"$MountDir" /Remove-Package /PackageName:"$($Pkg.PackageName)" /Quiet /NoRestart | Out-Null
+            break
         }
     }
 }
+
+dism.exe /Image:"$MountDir" /Remove-Edge /Quiet /NoRestart 2>$null | Out-Null
+
+Write-Host "  - [DISM] Purging orphaned Default App Associations..." -ForegroundColor DarkGray
+$AssocFile = "$Workspace\appassoc.xml"
+dism.exe /Image:"$MountDir" /Export-DefaultAppAssociations:"$AssocFile" | Out-Null
+if (Test-Path $AssocFile) {
+    $AssocContent = Get-Content -Path $AssocFile
+    $CleanAssoc = $AssocContent | Where-Object { $_ -notmatch 'AppX|MicrosoftEdge|Zune|Bing|Xbox' }
+    $CleanAssoc | Set-Content -Path $AssocFile -Force
+    dism.exe /Image:"$MountDir" /Import-DefaultAppAssociations:"$AssocFile" | Out-Null
+}
+
 
 # Phase 9: Registry"ing"
 Write-Host "`n[8/14] Applying bypassing requirements & registry..." -ForegroundColor Yellow
