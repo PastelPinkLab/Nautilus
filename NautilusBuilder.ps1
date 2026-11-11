@@ -856,27 +856,35 @@ Rename-Item -Path $OptimizedFile -NewName "install.$DestExt"
 
 $InstallSystem = $DestExt
 
-# Phase 12: Bypass
-Write-Host "`n[11/14] Mounting boot.wim to bypass hardwares..." -ForegroundColor Yellow
-dism.exe /Mount-Image /ImageFile:"$ExtractDir\sources\boot.wim" /Index:2 /MountDir:"$MountDir"
+# Phase 13: Bypass
+Write-Host "`n[12/15] Mounting boot.wim (Index 2) for Hardware Bypass & Storage Drivers..." -ForegroundColor Yellow
+dism.exe /Mount-Image /ImageFile:"$ExtractDir\sources\boot.wim" /Index:2 /MountDir:"$MountDir" /Optimize
+
+if ($UseDriverInjection -and (Test-Path $BootDriverFolder)) {
+    $BootInfCount = (Get-ChildItem -Path $BootDriverFolder -Recurse -Filter "*.inf" -File -ErrorAction SilentlyContinue | Measure-Object).Count
+    if ($BootInfCount -gt 0) {
+        Write-Host "  - Injecting $BootInfCount boot-critical drivers (NVMe/VMD/USB/Net) into WinPE..." -ForegroundColor Cyan
+        dism.exe /Image:"$MountDir" /Add-Driver /Driver:"$BootDriverFolder" /Recurse /ForceUnsigned | Out-Null
+        Write-Host "  - WinPE driver injection completed." -ForegroundColor Green
+    }
+}
 
 try {
     reg load HKLM\zSYSTEM "$MountDir\Windows\System32\config\SYSTEM" | Out-Null
-
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassCPUCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassRAMCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassSecureBootCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassStorageCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassTPMCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\MoSetup' 'AllowUpgradesWithUnsupportedTPMOrCPU' 'REG_DWORD' '1'
-}
-finally {
+    if ($HardwareBypass -eq "Y") {
+        Write-Host "  - Applying Hardware Bypass to WinPE..." -ForegroundColor DarkGray
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassCPUCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassRAMCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassSecureBootCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassStorageCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassTPMCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\MoSetup' 'AllowUpgradesWithUnsupportedTPMOrCPU' 'REG_DWORD' '1'
+    }
+} finally {
     reg unload HKLM\zSYSTEM 2>$null | Out-Null
-    [GC]::Collect()
-    Start-Sleep -Seconds 3
 }
 
-Write-Host "`n[12/14] Saving changes to boot.wim..." -ForegroundColor Yellow
+Write-Host "`n[13/15] Saving changes to boot.wim..." -ForegroundColor Yellow
 dism.exe /Unmount-Image /MountDir:"$MountDir" /Commit
 
 # Phase 13: Autounattend.xml
