@@ -314,8 +314,8 @@ if ($UseDriverInjection) {
     }
 }
 
-# Phase 5: Mounting ISO and copying
-Write-Host "`n[1/14] Mounting ISO and copying contents into the workspace..." -ForegroundColor Yellow
+# Phase 4: Mounting ISO and copying
+Write-Host "`n[1/15] Mounting ISO and copying contents into the workspace..." -ForegroundColor Yellow
 $IsoImage = Mount-DiskImage -ImagePath $IsoPath -PassThru
 $IsoDrive = ($IsoImage | Get-Volume).DriveLetter + ":"
 
@@ -329,14 +329,68 @@ if (Test-Path "$ExtractDir\sources\install.esd") {
 Set-ItemProperty -Path "$ExtractDir\sources\install.$InstallSystem" -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
 Set-ItemProperty -Path "$ExtractDir\sources\boot.wim" -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
 
-# Phase 6: Choosing index
-Write-Host "`n[2/14] List of available Windows SKUs:" -ForegroundColor Yellow
+# Phase 5: Choosing index
+Write-Host "`n[2/15] List of available Windows SKUs:" -ForegroundColor Yellow
 dism.exe /Get-WimInfo /WimFile:"$ExtractDir\sources\install.$InstallSystem"
 $WimIndex = Read-Host "-> Enter the index number you want to build (e.g., 6)"
 if ([string]::IsNullOrWhiteSpace($WimIndex)) { $WimIndex = "1" }
 
-Write-Host "`n[3/14] Extracting Windows system (Mounting WIM Index $WimIndex)..." -ForegroundColor Yellow
-dism.exe /Mount-Image /ImageFile:"$ExtractDir\sources\install.$InstallSystem" /Index:$WimIndex /MountDir:"$MountDir" /Optimize
+if ($InstallSystem -eq "esd") {
+    Write-Host "`n[!] Detected install.esd (Read-Only format). Converting Index $WimIndex to install.wim first..." -ForegroundColor Cyan
+    $TempWim = "$ExtractDir\sources\install.wim"
+    dism.exe /Export-Image /SourceImageFile:"$ExtractDir\sources\install.esd" /SourceIndex:$WimIndex /DestinationImageFile:"$TempWim" /Compress:fast
+    Remove-Item -Path "$ExtractDir\sources\install.esd" -Force
+    $InstallSystem = "wim"
+    $WimIndex = "1"
+}
+
+Write-Host "`n[3/15] Mounting install.wim (Index $WimIndex)..." -ForegroundColor Yellow
+dism.exe /Mount-Image /ImageFile:"$ExtractDir\sources\install.wim" /Index:$WimIndex /MountDir:"$MountDir" /Optimize
+
+Write-Host "`n[SCAN] Inspecting system inventory before debloat..." -ForegroundColor Cyan
+$CapabilityReport = Join-Path $Workspace "capabilities-before.txt"
+$FeatureReport    = Join-Path $Workspace "features-before.txt"
+$PackageReport    = Join-Path $Workspace "packages-before.txt"
+
+$InstalledCapabilities = Get-WindowsCapability -Path $MountDir -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Installed" }
+if ($InstalledCapabilities) {
+    $InstalledCapabilities.Name | Out-File -FilePath $CapabilityReport -Encoding UTF8
+    Write-Host "  - Capabilities found: $($InstalledCapabilities.Count) (Saved to capabilities-before.txt)" -ForegroundColor DarkGray
+}
+$InstalledFeatures = Get-WindowsOptionalFeature -Path $MountDir -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Enabled" }
+if ($InstalledFeatures) {
+    $InstalledFeatures.FeatureName | Out-File -FilePath $FeatureReport -Encoding UTF8
+    Write-Host "  - Optional Features found: $($InstalledFeatures.Count) (Saved to features-before.txt)" -ForegroundColor DarkGray
+}
+
+$PackageScan = dism.exe /Image:"$MountDir" /Get-Packages /English
+$PackageScan | Out-File -FilePath $PackageReport -Encoding UTF8
+$PkgNames = $PackageScan | Select-String "Package Identity : " | ForEach-Object { $_.Line.Replace("Package Identity : ", "").Trim() }
+Write-Host "  - CBS Packages found: $($PkgNames.Count) (Saved to packages-before.txt)" -ForegroundColor DarkGray
+
+Write-Host "  - Deep scanning hidden CBS Packages (Registry direct mapping)..." -ForegroundColor DarkGray
+$HiddenPkgReport = Join-Path $Workspace "hidden-packages-before.txt"
+
+reg load HKLM\zSOFTWARE "$MountDir\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
+try {
+    $CbsBaseKey = "zSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages"
+    $BaseHive = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($CbsBaseKey)
+    if ($BaseHive) {
+        $AllPkgNames = $BaseHive.GetSubKeyNames()
+        
+        $FilteredPkgs = $AllPkgNames | Where-Object {
+            $_ -notlike "Package_for_RollupFix*" -and
+            $_ -notlike "Package_for_ServicingStack*" -and
+            $_ -notlike "Package_for_KB*"
+        }
+        
+        $FilteredPkgs | Out-File -FilePath $HiddenPkgReport -Encoding UTF8
+        Write-Host "  - Hidden/Deep CBS Packages found: $($FilteredPkgs.Count) (Saved to hidden-packages-before.txt)" -ForegroundColor DarkGray
+        $BaseHive.Close()
+    }
+} finally {
+    reg unload HKLM\zSOFTWARE 2>$null | Out-Null
+}
 
 # Phase 7: Debloating
 
