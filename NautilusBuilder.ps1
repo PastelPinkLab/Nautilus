@@ -802,6 +802,17 @@ finally {
     Start-Sleep -Seconds 3
 }
 
+# Phase 10: Driver Injection
+Write-Host "`n[9/15] Injecting full hardware drivers into install.wim..." -ForegroundColor Yellow
+if ($UseDriverInjection) {
+    $InfCount = (Get-ChildItem -Path $DriverFolder -Recurse -Filter "*.inf" -File -ErrorAction SilentlyContinue | Measure-Object).Count
+    if ($InfCount -gt 0) {
+        Write-Host "  - Injecting $InfCount driver packages into offline OS..." -ForegroundColor DarkGray
+        dism.exe /Image:"$MountDir" /Add-Driver /Driver:"$DriverFolder" /Recurse /ForceUnsigned | Out-Null
+        Write-Host "  - OS driver injection completed." -ForegroundColor Green
+    }
+}
+
 # Phase 10: ResetBase
 Write-Host "`n[9/14] Deep cleaning image components..." -ForegroundColor Yellow
 
