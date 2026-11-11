@@ -154,15 +154,105 @@ if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
     Exit
 }
 
-# Phase 2: Creating workspaces
-$Workspace = "C:\NautilusBuilder"
-$MountDir = "$Workspace\Mount"
-$ExtractDir = "$Workspace\Extract"
-$FinalISO = "C:\Nautilus.iso"
-
+# Phase 2: Build configuration
 Clear-Host
 Write-Host "=== PastelPink Nautilus w/ Administrator ===" -ForegroundColor Cyan
 Write-Host "=== for Windows 11 ===" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "================================================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "[!] THIS PROJECT IS NOT AFFILIATED WITH MICROSOFT:" -ForegroundColor Yellow
+Write-Host "    PastelPink Nautilus is an independent open-source utility and is NOT endorsed," -ForegroundColor White
+Write-Host "    sponsored, or officially connected to Microsoft Corporation." -ForegroundColor White
+Write-Host "    'Windows' is a registered trademark of Microsoft Corporation." -ForegroundColor White
+Write-Host ""
+Write-Host "[!] INTENDED USAGE & DISTRIBUTION WARNING:" -ForegroundColor Yellow
+Write-Host "    This script is designed for personal, local image creation." -ForegroundColor White
+Write-Host "    Redistributing modified ISOs to third parties, especially without a clear" -ForegroundColor White
+Write-Host "    understanding of removed packages, dependencies, or security risks," -ForegroundColor White
+Write-Host "    is not recommended. Always use official media and valid licenses." -ForegroundColor White
+Write-Host ""
+Write-Host "[!] DISCLAIMER OF WARRANTY (AS-IS):" -ForegroundColor Yellow
+Write-Host "    This tool modifies core system components and is provided 'AS IS'," -ForegroundColor White
+Write-Host "    without warranty of any kind. Modifying system packages may lead to" -ForegroundColor White
+Write-Host "    instability or update failures. Use entirely at your own risk." -ForegroundColor White
+Write-Host ""
+Write-Host "    Thanks for using Nautilus :D, we appreciate all of your support! <3"
+Write-Host ""
+Write-Host "================================================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "`n=== Build configuration ===" -ForegroundColor Yellow
+
+$WorkspaceInput = Read-Host "-> Enter workspace path (Default: C:\NautilusBuilder)"
+if ([string]::IsNullOrWhiteSpace($WorkspaceInput)) { 
+    $Workspace = "C:\NautilusBuilder" 
+} else { 
+    $Workspace = $WorkspaceInput 
+}
+$MountDir = "$Workspace\Mount"
+$ExtractDir = "$Workspace\Extract"
+
+$IsoPath = Read-Host "-> Enter the path of the original ISO (Example: C:\Windows11.iso)"
+if (!(Test-Path $IsoPath -PathType Leaf)) {
+    Write-Host "Cannot find the ISO, please check the path again :3" -ForegroundColor Red
+    Exit
+}
+
+$FinalISO = Read-Host "-> Enter output ISO path (Default: C:\Nautilus.iso)"
+if ([string]::IsNullOrWhiteSpace($FinalISO)) { $FinalISO = "C:\Nautilus.iso" }
+
+$CompressionChoice = Read-Host "-> Compression: [1] WIM [2] ESD (Default: 1)"
+if ([string]::IsNullOrWhiteSpace($CompressionChoice)) { $CompressionChoice = "1" }
+
+$InjectDriver = Read-Host "-> Inject drivers into ISO? [Y/N] (Default: N)"
+if ([string]::IsNullOrWhiteSpace($InjectDriver)) { $InjectDriver = "N" }
+$UseDriverInjection = ($InjectDriver.Trim().ToUpperInvariant() -eq "Y")
+$AutoScanDrivers = $false
+$DriverFolder = ""
+
+if ($UseDriverInjection) {
+    $DriverInput = Read-Host "-> Driver folder path (Leave blank to auto-export from current system)"
+    if ([string]::IsNullOrWhiteSpace($DriverInput)) {
+        $AutoScanDrivers = $true
+        $DriverFolder = "$Workspace\AutoDrivers"
+    } elseif (Test-Path $DriverInput -PathType Container) {
+        $DriverFolder = $DriverInput
+    } else {
+        Write-Host "  [!] Driver folder does not exist! Driver injection will be disabled." -ForegroundColor Red
+        $UseDriverInjection = $false
+    }
+}
+
+$HardwareBypass = Read-Host "-> Enable hardware bypass (TPM/CPU/Secure Boot)? [Y/N]"
+if ([string]::IsNullOrWhiteSpace($HardwareBypass)) { $HardwareBypass = "N" }
+$HardwareBypass = $HardwareBypass.Trim().ToUpperInvariant()
+
+$AggressiveDebloat = Read-Host "-> Use aggressive debloat? [Y/N]"
+if ([string]::IsNullOrWhiteSpace($AggressiveDebloat)) { $AggressiveDebloat = "N" }
+$AggressiveDebloat = $AggressiveDebloat.Trim().ToUpperInvariant()
+
+$DriverDisplay = if (-not $UseDriverInjection) { 'Disabled' } elseif ($AutoScanDrivers) { 'Exporting installed drivers' } else { $DriverFolder }
+
+Write-Host ""
+Write-Host "============================================"
+Write-Host "Selected configuration:" -ForegroundColor Cyan
+Write-Host "  - Workspace: $Workspace" -ForegroundColor DarkGray
+Write-Host "  - ISO: $IsoPath" -ForegroundColor DarkGray
+Write-Host "  - Output ISO: $FinalISO" -ForegroundColor DarkGray
+Write-Host "  - Compression: $CompressionChoice" -ForegroundColor DarkGray
+Write-Host "  - Drivers: $DriverDisplay" -ForegroundColor DarkGray
+Write-Host "  - Hardware bypass: $HardwareBypass" -ForegroundColor DarkGray
+Write-Host "  - Aggressive debloat: $AggressiveDebloat" -ForegroundColor DarkGray
+Write-Host "============================================"
+Write-Host ""
+
+$ConfirmBuild = Read-Host "Start build now? [Y/N]"
+Write-Host ""
+if ([string]::IsNullOrWhiteSpace($ConfirmBuild)) { $ConfirmBuild = "N" }
+if ($ConfirmBuild.Trim().ToUpperInvariant() -ne "Y") {
+    Write-Host "Build cancelled by user." -ForegroundColor Yellow
+    Exit
+}
 
 # Phase 3: Cleaning stuffs
 Write-Host "[*] Cleaning up previous workspaces..." -ForegroundColor DarkGray
