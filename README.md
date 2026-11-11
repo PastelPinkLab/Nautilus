@@ -4,7 +4,7 @@ Nautilus
 
 ---
 
-<img src="Images/powershell.png" alt="image" width="1000">
+<img src="images/powershell.png" alt="image" width="1000">
 
 </h1> 
 
