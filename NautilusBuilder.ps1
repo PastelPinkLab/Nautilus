@@ -2,8 +2,149 @@
 function Set-RegistryValue($Path, $Name, $Type, $Data) {
     reg add "$Path" /v "$Name" /t "$Type" /d "$Data" /f 2>$null | Out-Null
 }
-function Remove-RegistryValue($Path) {
-    reg delete "$Path" /f 2>$null | Out-Null
+function Remove-RegistryValue($Path, $Name) {
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        reg delete "$Path" /f 2>$null | Out-Null
+    } else {
+        reg delete "$Path" /v "$Name" /f 2>$null | Out-Null
+    }
+}
+
+function Enable-ProcessPrivileges {
+    $Definition = @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class TokenManipulator {
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+        internal static extern bool AdjustTokenPrivileges(IntPtr htok, bool disall, ref TokPriv1Luid newst, int len, IntPtr prev, IntPtr relen);
+        [DllImport("kernel32.dll", ExactSpelling = true)]
+        internal static extern IntPtr GetCurrentProcess();
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+        internal static extern bool OpenProcessToken(IntPtr h, int acc, ref IntPtr phtok);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        internal static extern bool LookupPrivilegeValue(string host, string name, ref long pluid);
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        internal struct TokPriv1Luid { public int Count; public long Luid; public int Attr; }
+        public static void AddPrivilege(string privilege) {
+            IntPtr hproc = GetCurrentProcess();
+            IntPtr htok = IntPtr.Zero;
+            OpenProcessToken(hproc, 0x0028, ref htok);
+            TokPriv1Luid tp = new TokPriv1Luid { Count = 1, Luid = 0, Attr = 0x00000002 };
+            LookupPrivilegeValue(null, privilege, ref tp.Luid);
+            AdjustTokenPrivileges(htok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+        }
+    }
+"@
+    if (-not ([System.Management.Automation.PSTypeName]'TokenManipulator').Type) {
+        Add-Type -TypeDefinition $Definition
+    }
+    [TokenManipulator]::AddPrivilege("SeTakeOwnershipPrivilege")
+    [TokenManipulator]::AddPrivilege("SeRestorePrivilege")
+    [TokenManipulator]::AddPrivilege("SeBackupPrivilege")
+}
+
+function Unlock-OfflineCbsPackages {
+    param (
+        [string]$MountPath,
+        [string[]]$TargetPatterns
+    )
+    Enable-ProcessPrivileges
+    $AdminSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    $AdminRule = New-Object System.Security.AccessControl.RegistryAccessRule(
+        $AdminSID, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
+    )
+
+    reg load HKLM\zSOFTWARE "$MountPath\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
+    try {
+        $CbsBaseKey = "zSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages"
+        $BaseHive = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($CbsBaseKey, $true)
+        if (-not $BaseHive) { return }
+
+        $AllPkgNames = $BaseHive.GetSubKeyNames()
+        foreach ($Pattern in $TargetPatterns) {
+            $MatchedPkgs = $AllPkgNames | Where-Object { $_ -like $Pattern }
+            foreach ($PkgName in $MatchedPkgs) {
+                $PkgRelativePath = "$CbsBaseKey\$PkgName"
+                
+                $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                    $PkgRelativePath,
+                    [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                    [System.Security.AccessControl.RegistryRights]::TakeOwnership
+                )
+                if ($RegKey) {
+                    $Acl = $RegKey.GetAccessControl([System.Security.AccessControl.AccessControlSections]::None)
+                    $Acl.SetOwner($AdminSID)
+                    $RegKey.SetAccessControl($Acl)
+                    $RegKey.Close()
+                }
+
+                $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                    $PkgRelativePath,
+                    [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                    [System.Security.AccessControl.RegistryRights]::ChangePermissions
+                )
+                if ($RegKey) {
+                    $Acl = $RegKey.GetAccessControl()
+                    $Acl.AddAccessRule($AdminRule)
+                    $RegKey.SetAccessControl($Acl)
+                    $RegKey.Close()
+                }
+
+                $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($PkgRelativePath, $true)
+                if ($RegKey) {
+                    $RegKey.SetValue("Visibility", 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+                    $RegKey.DeleteValue("DefVis", $false)
+                    
+                    if ($RegKey.GetSubKeyNames() -contains "Owners") {
+                        $OwnersKey = $RegKey.OpenSubKey("Owners", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::TakeOwnership)
+                        if ($OwnersKey) {
+                            $OAcl = $OwnersKey.GetAccessControl([System.Security.AccessControl.AccessControlSections]::None)
+                            $OAcl.SetOwner($AdminSID)
+                            $OwnersKey.SetAccessControl($OAcl)
+                            $OwnersKey.Close()
+                        }
+                        $OwnersKey = $RegKey.OpenSubKey("Owners", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+                        if ($OwnersKey) {
+                            $OAcl = $OwnersKey.GetAccessControl()
+                            $OAcl.AddAccessRule($AdminRule)
+                            $OwnersKey.SetAccessControl($OAcl)
+                            $OwnersKey.Close()
+                        }
+                        $RegKey.DeleteSubKeyTree("Owners", $false)
+                    }
+                    $RegKey.Close()
+                }
+            }
+        }
+        $BaseHive.Close()
+    } finally {
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        reg unload HKLM\zSOFTWARE 2>$null | Out-Null
+    }
+}
+
+function Get-OscdimgPath {
+    $candidates = @(
+        "$env:SystemRoot\System32\oscdimg.exe",
+        "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
+        "$env:ProgramFiles(x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
+        "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\Oscdimg\oscdimg.exe",
+        "$env:ProgramFiles(x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\Oscdimg\oscdimg.exe"
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return $candidate
+        }
+    }
+
+    $cmd = Get-Command oscdimg.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) {
+        return $cmd.Source
+    }
+
+    return $null
 }
 
 # Phase 1: Administrator privileges
