@@ -396,56 +396,48 @@ try {
 
 $AdminGroup = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([System.Security.Principal.NTAccount]).Value
 
-Write-Host "`n[4/14] Debloating system apps..." -ForegroundColor Yellow
+Write-Host "`n[4/15] Debloating system apps..." -ForegroundColor Yellow
 
-Write-Host "  - Dynamically scanning and removing UWP/APPX apps..." -ForegroundColor DarkGray
+Write-Host "  - Dynamically scanning and removing UWP/APPX apps..."
 
 $KeepApps = @(
-    "Microsoft.AV1VideoExtension",
-    "Microsoft.AVCEncoderVideoExtension",
     "Microsoft.DesktopAppInstaller",
-    "Microsoft.HEIFImageExtension",
-    "Microsoft.HEVCVideoExtension",
-    "Microsoft.MPEG2VideoExtension",
     "Microsoft.NET.Native",
-    "Microsoft.RawImageExtension",
     "Microsoft.SecHealthUI",
     "Microsoft.Services.Store.Engagement",
     "Microsoft.StorePurchaseApp",
     "Microsoft.UI.Xaml",
     "Microsoft.VCLibs",
-    "Microsoft.VP9VideoExtensions",
-    "Microsoft.WebMediaExtensions",
-    "Microsoft.WebpImageExtension",
     "Microsoft.WindowsAppRuntime"
 )
 
-$InstalledPackages = Get-AppxProvisionedPackage -Path $MountDir
-
-foreach ($App in $InstalledPackages) {
+$InstalledAppx = Get-AppxProvisionedPackage -Path $MountDir -ErrorAction SilentlyContinue
+foreach ($App in $InstalledAppx) {
     $IsKept = $false
-    
     foreach ($Keep in $KeepApps) {
         if ($App.DisplayName -match $Keep -or $App.PackageName -match $Keep) {
             $IsKept = $true
             break
         }
     }
-
     if (-not $IsKept) {
-        Write-Host "  - Deleted $($App.DisplayName)" -ForegroundColor DarkGray
+        Write-Host "  - Removing: $($App.DisplayName)" -ForegroundColor DarkGray
         Remove-AppxProvisionedPackage -Path $MountDir -PackageName $App.PackageName -ErrorAction SilentlyContinue | Out-Null
     } else {
-        Write-Host "  - Kept $($App.DisplayName)" -ForegroundColor Green
+        Write-Host "  - Keeping : $($App.DisplayName)" -ForegroundColor Green
     }
 }
 
-Write-Host "`n[5/14] Removing Edge and OneDrive..." -ForegroundColor Yellow
+Write-Host "  - Optimizing remaining AppX packages (Hardlink deduplication)..." -ForegroundColor Cyan
+dism.exe /Image:"$MountDir" /Optimize-ProvisionedAppxPackages /Quiet | Out-Null
+
+Write-Host "`n[5/15] Removing Edge and OneDrive..." -ForegroundColor Yellow
 
 $EdgePaths = @(
     "$MountDir\Program Files (x86)\Microsoft\Edge",
     "$MountDir\Program Files (x86)\Microsoft\EdgeUpdate",
-    "$MountDir\Program Files (x86)\Microsoft\EdgeCore"
+    "$MountDir\Program Files (x86)\Microsoft\EdgeCore",
+    "$MountDir\Windows\System32\Microsoft-Edge-Webview"
 )
 
 foreach ($Path in $EdgePaths) {
@@ -482,60 +474,81 @@ foreach ($Path in $OneDrivePaths) {
     }
 }
 
-Write-Host "`n[6/14] Removing Telemetry files..." -ForegroundColor Yellow
+Write-Host "`n[5/15] Unlocking DMA Region Policy & Purging Optional Features..." -ForegroundColor Yellow
 
-Write-Host "  - Deleting Telemetry files..." -ForegroundColor DarkGray
-
-$TelemetryFiles = @(
-    "$MountDir\Windows\System32\appraiser.exe",
-    "$MountDir\Windows\System32\CompatTelRunner.exe",
-    "$MountDir\Windows\System32\DeviceCensus.exe",
-    "$MountDir\Windows\System32\wsqmcons.exe"
-)
-
-foreach ($File in $TelemetryFiles) {
-    if (Test-Path $File) {
-        takeown.exe /F $File /A 2>$null | Out-Null
-        icacls.exe $File /grant "$($AdminGroup):(F)" /C /Q 2>$null | Out-Null
-        Remove-Item -Path $File -Force -ErrorAction SilentlyContinue
-    }
+$DmaPolicyJson = "$MountDir\Windows\System32\IntegratedServicesRegionPolicySet.json"
+if (Test-Path $DmaPolicyJson) {
+    Write-Host "  - Unlocking IntegratedServicesRegionPolicySet.json (DMA Mode)..." -ForegroundColor DarkGray
+    takeown.exe /F "$DmaPolicyJson" /A 2>$null | Out-Null
+    icacls.exe "$DmaPolicyJson" /grant "*S-1-5-32-544:(F)" /C /Q 2>$null | Out-Null
+    $JsonRaw = Get-Content -Path $DmaPolicyJson -Raw -Encoding UTF8
+    $JsonRaw = $JsonRaw -replace '"defaultState"\s*:\s*"disabled"', '"defaultState": "enabled"'
+    $JsonRaw | Set-Content -Path $DmaPolicyJson -Encoding UTF8 -Force
 }
 
-Write-Host "  - Deleting Retail Demo & Help..." -ForegroundColor DarkGray
-$UselessFolders = @(
-    "$MountDir\Windows\System32\RetailDemo",
-    "$MountDir\Windows\Help",
-    "$MountDir\Windows\System32\DiagSvcs",
-    "$MountDir\PerfLogs"
-)
-
-foreach ($Folder in $UselessFolders) {
-    if (Test-Path $Folder) {
-        takeown.exe /F $Folder /R /A /D Y 2>$null | Out-Null
-        icacls.exe $Folder /grant "$($AdminGroup):(F)" /T /C /Q 2>$null | Out-Null
-        Remove-Item -Path $Folder -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-Write-Host "  - Deleting Optional features..."
 $OptionalFeatures = @(
     "Printing-Foundation-InternetPrinting-Client",
+    "Printing-XPSServices-Features",
+    "Printing-PrintToPDFServices-Features",
     "WorkFolders-Client",
+    "SMB1Protocol",
+    "SMB1Protocol-Client",
+    "SMB1Protocol-Server",
+    "SMB1Protocol-Deprecation",
+    "MicrosoftWindowsPowerShellV2",
+    "MicrosoftWindowsPowerShellV2Root",
+    "MSRDC-Infrastructure",
     "MediaPlayback",
-    "SMB1Protocol"
+    "WindowsMediaPlayer"
 )
 
-foreach ($Feature in $OptionalFeatures) {
-    $CheckFeature = Get-WindowsOptionalFeature -Path $MountDir -FeatureName $Feature -ErrorAction SilentlyContinue
-    
-    if ($CheckFeature) {
-        Write-Host "   - Removed $Feature" -ForegroundColor DarkGray
-        try {
-            Disable-WindowsOptionalFeature -Path $MountDir -FeatureName $Feature -Remove -NoRestart -ErrorAction Stop | Out-Null
-        } catch {
+$AvailableFeatures = Get-WindowsOptionalFeature -Path $MountDir -ErrorAction SilentlyContinue |
+    Where-Object { $_.State -ne "DisabledWithPayloadRemoved" }
+
+foreach ($FeatName in $OptionalFeatures) {
+    if ($AvailableFeatures.FeatureName -contains $FeatName) {
+        Write-Host "  - Purging $FeatName" -ForegroundColor DarkGray
+        Disable-WindowsOptionalFeature -Path $MountDir -FeatureName $FeatName -Remove -NoRestart -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
+Write-Host "`n[6/15] Removing Windows Capabilities (FOD)..." -ForegroundColor Yellow
+
+$CapabilityPatterns = @(
+    "App.StepsRecorder*",
+    "App.Support.QuickAssist*",
+    "Browser.InternetExplorer*",
+    "MathRecognizer*",
+    "Media.WindowsMediaPlayer*",
+    "Microsoft.Wallpapers.Extended*",
+    "Microsoft.Windows.PowerShell.ISE*",
+    "Microsoft.Windows.WordPad*",
+    "OneCoreUAP.OneSync*",
+    "Print.Management.Console*",
+    "WMI-SNMP-Provider*",
+    "VBSCRIPT*"
+)
+
+if ($AggressiveDebloat -eq "Y") {
+    $CapabilityPatterns += @(
+        "Language.Handwriting*",
+        "Language.OCR*",
+        "Language.Speech*",
+        "Language.TextToSpeech*",
+        "Rsat.*"
+    )
+}
+
+$CurrentCapabilities = Get-WindowsCapability -Path $MountDir -ErrorAction SilentlyContinue |
+    Where-Object { $_.State -eq "Installed" -and $_.Name -notlike "*Language.Basic*" }
+
+foreach ($Cap in $CurrentCapabilities) {
+    foreach ($Pat in $CapabilityPatterns) {
+        if ($Cap.Name -like $Pat) {
+            Write-Host "  - Removing $($Cap.Name)" -ForegroundColor DarkGray
+            Remove-WindowsCapability -Path $MountDir -Name $Cap.Name -ErrorAction SilentlyContinue | Out-Null
+            break
         }
-    } else {
-        Write-Host "   - Skipped $Feature (Not found in this Windows edition)" -ForegroundColor DarkGray
     }
 }
 
