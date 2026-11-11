@@ -833,15 +833,15 @@ Remove-Item -Path "$MountDir\Windows\WinSxS\InstallTemp\*" -Recurse -Force -Erro
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\DataStore\*" -Recurse -Force -ErrorAction SilentlyContinue
 
-# Phase 11: Saving & Exporting
-Write-Host "`n[10/14] Saving changes to install.$InstallSystem..." -ForegroundColor Yellow
+# Phase 12: Saving & Exporting
+Write-Host "`n[11/15] Saving changes to install.$InstallSystem..." -ForegroundColor Yellow
 dism.exe /Unmount-Image /MountDir:"$MountDir" /Commit | Out-Null
 
-Write-Host "`n[!] Choose compression:" -ForegroundColor Cyan
+Write-Host "`n[!] Compression mode selected:" -ForegroundColor Cyan
 Write-Host "   [1] WIM (Fast but also recommended)" -ForegroundColor Cyan
 Write-Host "   [2] ESD (Slow, smallest size)" -ForegroundColor Cyan
-$Choice = Read-Host "-> Enter 1 or 2 (Default: 1)"
 
+$Choice = $CompressionChoice
 $DestExt = if ($Choice -eq '2') { "esd" } else { "wim" }
 $CompressType = if ($Choice -eq '2') { "recovery" } else { "max" }
 
