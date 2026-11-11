@@ -813,18 +813,23 @@ if ($UseDriverInjection) {
     }
 }
 
-# Phase 10: ResetBase
-Write-Host "`n[9/14] Deep cleaning image components..." -ForegroundColor Yellow
+# Phase 11: ResetBase
+Write-Host "`n[10/15] Deep cleaning image components (ResetBase)..." -ForegroundColor Yellow
 
-Write-Host "  - Applying ResetBase..." -ForegroundColor DarkGray
-dism.exe /Image:$MountDir /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
+Write-Host "  - [DISM] Disabling Reserved Storage..." -ForegroundColor DarkGray
+dism.exe /Image:"$MountDir" /Set-ReservedStorageState /State:Disabled /Quiet | Out-Null
 
-Write-Host "  - Emptying WinSxS Temp..." -ForegroundColor DarkGray
-Remove-Item -Path "$MountDir\Windows\WinSxS\Backup\*" -Force -ErrorAction SilentlyContinue
+reg load HKLM\zSOFTWARE "$MountDir\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
+Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\SideBySide\Configuration' 'DisableResetbase' 'REG_DWORD' '0'
+Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\SideBySide\Configuration' 'SupersededActions' 'REG_DWORD' '1'
+reg unload HKLM\zSOFTWARE 2>$null | Out-Null
+
+Write-Host "  - Executing DISM Component Cleanup & ResetBase..." -ForegroundColor Cyan
+dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup /ResetBase
+
+Write-Host "  - Cleaning up temporary servicing caches..." -ForegroundColor DarkGray
 Remove-Item -Path "$MountDir\Windows\WinSxS\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "$MountDir\Windows\WinSxS\InstallTemp\*" -Recurse -Force -ErrorAction SilentlyContinue
-
-Write-Host "  - Emptying Windows Update Cache..." -ForegroundColor DarkGray
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\DataStore\*" -Recurse -Force -ErrorAction SilentlyContinue
 
