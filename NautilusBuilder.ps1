@@ -266,18 +266,52 @@ dism.exe /Cleanup-Mountpoints /Quiet | Out-Null
 
 if (Test-Path $Workspace) { 
     Remove-Item -Path $Workspace -Recurse -Force -ErrorAction SilentlyContinue 
-    # Forcing Powershell to wait for deleting heavy stuffs
     Start-Sleep -Seconds 2
 }
 
 New-Item -ItemType Directory -Force -Path $MountDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
 
-# Phase 4: ISO Selection
-$IsoPath = Read-Host "-> Enter the path of the original ISO (Example: C:\Windows11.iso)"
-if (!(Test-Path $IsoPath -PathType Leaf)) {
-    Write-Host "Cannot find the ISO, please check the path again :3" -ForegroundColor Red
-    Exit
+$BootDriverFolder = "$Workspace\BootDrivers"
+
+if ($UseDriverInjection) {
+    if ($AutoScanDrivers) {
+        Write-Host "  - Exporting third-party drivers from host system..." -ForegroundColor DarkGray
+        New-Item -ItemType Directory -Force -Path $DriverFolder | Out-Null
+        try {
+            Export-WindowsDriver -Online -Destination $DriverFolder -ErrorAction Stop | Out-Null
+            Write-Host "  - Host drivers exported to: $DriverFolder" -ForegroundColor Green
+        } catch {
+            Write-Host "  - Export failed: $($_.Exception.Message). Skipping driver injection." -ForegroundColor Yellow
+            $UseDriverInjection = $false
+        }
+    } elseif (-not (Test-Path $DriverFolder -PathType Container)) {
+        Write-Host "  - Driver folder '$DriverFolder' does not exist! Skipping driver injection." -ForegroundColor Yellow
+        $UseDriverInjection = $false
+    }
+
+    if ($UseDriverInjection) {
+        New-Item -ItemType Directory -Force -Path $BootDriverFolder | Out-Null
+        $BootCriticalClasses = @('SCSIAdapter', 'HDC', 'Volume', 'USB', 'Net', 'HIDClass', 'Mouse', 'Keyboard', 'System')
+        
+        Write-Host "  - Filtering boot-critical drivers (Storage/NVMe/USB/Net) for boot.wim..." -ForegroundColor DarkGray
+        $AllInfs = Get-ChildItem -Path $DriverFolder -Recurse -Filter "*.inf" -File -ErrorAction SilentlyContinue
+        
+        foreach ($Inf in $AllInfs) {
+            $Header = Get-Content -Path $Inf.FullName -TotalCount 60 -ErrorAction SilentlyContinue
+            $ClassMatch = $Header | Select-String -Pattern '^\s*Class\s*=\s*([a-zA-Z0-9_\-]+)' | Select-Object -First 1
+            
+            if ($ClassMatch) {
+                $DriverClass = $ClassMatch.Matches[0].Groups[1].Value.Trim()
+                if ($BootCriticalClasses -contains $DriverClass) {
+                    $DestSubDir = Join-Path $BootDriverFolder $Inf.Directory.Name
+                    if (-not (Test-Path $DestSubDir)) {
+                        Copy-Item -Path $Inf.Directory.FullName -Destination $DestSubDir -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+    }
 }
 
 # Phase 5: Mounting ISO and copying
