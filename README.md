@@ -1,10 +1,16 @@
-# Nautilus [Builder] for Windows 11
+<h1 align="center">
 
-Nautilus is a lightweight, free and easy to use PowerShell that allows you to quickly debloat your Windows ISO. Instead of manually applying tweaks on a live system, this tool automates the creation of a fully debloated, pure and telemetry-free Windows 11 ISO (`.iso`). 
+Nautilus
 
-Building with pure performance for both low-end and high-end PCs, Nautilus does not use CompactOS, makes the process quick and easy!
+---
 
-![Powershell](/Images/powershell.png)
+<img src="Images/powershell.png" alt="image" width="1000">
+
+</h1> 
+
+Nautilus is a lightweight and free tool that using PowerShell that allows you to quickly debloat your Windows ISO. Instead of manually applying tweaks on a live system, this tool automates the creation of a fully debloated, pure and telemetry-free Windows 11 ISO (`.iso`). 
+
+Building within pure performance for both low-end and high-end PCs, makes the process quick!
 
 > Nautilus is also heavily based on Tiny11Builder in Tweaks, APPXs removal, etc...
 
@@ -13,26 +19,35 @@ Building with pure performance for both low-end and high-end PCs, Nautilus does 
 > [!Warning]
 > Great care went into making sure this script does not unintentionally break any OS functionality, but use at your own risk! This script modifies core system images offline. Always test your generated ISO on a Virtual Machine before deploying it on your main hardware.
 
-> This script will work only on Windows 11, if you're looking for Windows 10 builder, you can give it a look on [Elflower](https://github.com/PastelPinkLab/Elflower).
+> This script will work only on Windows 11, if you're looking for Windows 10 builder, you can take it a look on [Elflower](https://github.com/PastelPinkLab/Elflower).
 
-## What things will be removed:
+## What things will be removed (Scanned in Windows 11 26H2)
 
 #### APPXs
 - Clipchamp.Clipchamp
 - Microsoft.ApplicationCompatibilityEnhancements
+- Microsoft.AV1VideoExtension
+- Microsoft.AVCEncoderVideoExtension
 - Microsoft.BingNews
 - Microsoft.BingSearch
 - Microsoft.BingWeather
 - Microsoft.GamingApp
 - Microsoft.GetHelp
+- Microsoft.HEIFImageExtension
+- Microsoft.HEVCVideoExtension
 - Microsoft.MicrosoftOfficeHub
 - Microsoft.MicrosoftSolitaireCollection
 - Microsoft.MicrosoftStickyNotes
+- Microsoft.MPEG2VideoExtension
 - Microsoft.OutlookForWindows
 - Microsoft.Paint
 - Microsoft.PowerAutomateDesktop
+- Microsoft.RawImageExtension
 - Microsoft.ScreenSketch
 - Microsoft.Todos
+- Microsoft.VP9VideoExtensions
+- Microsoft.WebMediaExtensions
+- Microsoft.WebpImageExtension
 - Microsoft.Windows.DevHome
 - Microsoft.Windows.Photos
 - Microsoft.WindowsAlarms
@@ -54,34 +69,51 @@ Building with pure performance for both low-end and high-end PCs, Nautilus does 
 - MicrosoftWindows.CrossDevice
 - MSTeams
 
-#### Optional Features
+#### Optional Features (Unlocked DMA Region Policy)
 - Printing-Foundation-InternetPrinting-Client
+- Printing-XPSServices-Features
+- Printing-PrintToPDFServices-Features
 - WorkFolders-Client
 - MediaPlayback
 - SMB1Protocol
+- SMB1Protocol-Client
+- SMB1Protocol-Server
+- SMB1Protocol-Deprecation
+- MSRDC-Infrastructure
+- WindowsMediaPlayer
 
-#### And more...
-- Edge and OneDrive
-- Retail Demo
-- DiagSvcs
-- Perflogs
-- CompatTelRunner
-- DeviceCensus
-- appraiser
-- wsqmcons
-- InternetExplorer
-- LanguageFeatures-Handwriting
-- LanguageFeatures-OCR
-- LanguageFeatures-Speech
+#### Capabilities (FOD)
+- App.StepsRecorder
+- Browser.InternetExplorer
+- Language.Handwriting
+- Language.OCR
+- Language.Speech
+- Language.TextToSpeech
+- MathRecognizer
+- Media.WindowsMediaPlayer
+- Microsoft.Wallpapers.Extended
+- Microsoft.Windows.PowerShell.ISE
+- OneCoreUAP.OneSync
+- Print.Management.Console
+- VBSCRIPT
+
+#### CBS Package
+- Edge (Edge, EdgeUpdate, EdgeCore)
+- Microsoft-Edge-Webview
+- OneDrive
+- Microsoft-Copilot-Package
+- Microsoft-Windows-CEIPEnable-Adm-Package
+- Microsoft-Windows-FlipGridPWA-Package
+- Microsoft-Windows-Internet-Browser-Package
+- Microsoft-Windows-OneDrive-Setup-Package
+- Microsoft-Windows-OneDrive-Setup-WOW64-Package
+- Microsoft-Windows-OutlookPWA-Package
+- Microsoft-Windows-Printing-XpsDocumentWriter-Opt-Package
+- Microsoft-Windows-Printing-XPSServices-Package
+- Microsoft-Windows-RemoteAssistance-Package-Client
+- UserExperience-AIX-Package
 - LanguageFeatures-TextToSpeech
-- MediaPlayer
-- OneDrive-Setup-Package
-- PowerShell-ISE-FOD
-- QuickAssist-
-- StepsRecorder
-- TabletPCMath
-- Wallpaper-Content-Extended
-- WordPad-FoD
+- UserExperience-Recall-Package
 
 ## Tweaks
 - Telemetry, sponsors apps
@@ -92,6 +124,7 @@ Building with pure performance for both low-end and high-end PCs, Nautilus does 
 - Disable ContentDelivery
 - Disable Bitlocker
 - Bypass TPM 2.0 and unsupported CPU
+- Disable HR and Hibernation
 - ResetBase
 
 ## So... how to use the builder?
@@ -108,6 +141,8 @@ Building with pure performance for both low-end and high-end PCs, Nautilus does 
 3. Temporarily allow script execution by running:
    ```PowerShell
    Set-ExecutionPolicy Unrestricted -Scope Process -Force
+4. Follow the instructions
+5. Sit back and let the tool do it
 
 ## License
 Nautilus is licensed under the GPLv3 license. See the LICENSE file for more information.
