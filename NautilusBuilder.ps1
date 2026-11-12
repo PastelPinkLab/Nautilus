@@ -1,4 +1,17 @@
 # Registry helper functions
+
+function Ensure-HiveUnloaded([string]$HiveName) {
+    $maxRetry = 5
+    for ($i = 0; $i -lt $maxRetry; $i++) {
+        $result = reg query "HKLM\$HiveName" 2>&1
+        if ($LASTEXITCODE -ne 0) { return } # Already unloaded
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        Start-Sleep -Milliseconds 500
+        reg unload "HKLM\$HiveName" 2>$null | Out-Null
+    }
+}
+
 function Set-RegistryValue($Path, $Name, $Type, $Data) {
     reg add "$Path" /v "$Name" /t "$Type" /d "$Data" /f 2>$null | Out-Null
 }
@@ -118,9 +131,7 @@ function Unlock-OfflineCbsPackages {
         }
         $BaseHive.Close()
     } finally {
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
-        reg unload HKLM\zSOFTWARE 2>$null | Out-Null
+        Ensure-HiveUnloaded "zSOFTWARE"
     }
 }
 
@@ -227,9 +238,9 @@ $HardwareBypass = Read-Host "-> Enable hardware bypass (TPM/CPU/Secure Boot)? [Y
 if ([string]::IsNullOrWhiteSpace($HardwareBypass)) { $HardwareBypass = "N" }
 $HardwareBypass = $HardwareBypass.Trim().ToUpperInvariant()
 
-$AggressiveDebloat = Read-Host "-> Use aggressive debloat? [Y/N]"
-if ([string]::IsNullOrWhiteSpace($AggressiveDebloat)) { $AggressiveDebloat = "N" }
-$AggressiveDebloat = $AggressiveDebloat.Trim().ToUpperInvariant()
+$UseCustomWallpaper = Read-Host "-> Download & apply Nautilus wallpapers? [Y/N] (Default: Y)"
+if ([string]::IsNullOrWhiteSpace($UseCustomWallpaper)) { $UseCustomWallpaper = "Y" }
+$UseCustomWallpaper = $UseCustomWallpaper.Trim().ToUpperInvariant()
 
 $DriverDisplay = if (-not $UseDriverInjection) { 'Disabled' } elseif ($AutoScanDrivers) { 'Exporting installed drivers' } else { $DriverFolder }
 
@@ -242,7 +253,7 @@ Write-Host "  - Output ISO: $FinalISO" -ForegroundColor DarkGray
 Write-Host "  - Compression: $CompressionChoice" -ForegroundColor DarkGray
 Write-Host "  - Drivers: $DriverDisplay" -ForegroundColor DarkGray
 Write-Host "  - Hardware bypass: $HardwareBypass" -ForegroundColor DarkGray
-Write-Host "  - Aggressive debloat: $AggressiveDebloat" -ForegroundColor DarkGray
+Write-Host "  - Custom wallpapers: $UseCustomWallpaper" -ForegroundColor DarkGray
 Write-Host "============================================"
 Write-Host ""
 
@@ -299,12 +310,14 @@ if ($UseDriverInjection) {
         
         foreach ($Inf in $AllInfs) {
             $Header = Get-Content -Path $Inf.FullName -TotalCount 60 -ErrorAction SilentlyContinue
-            $ClassMatch = $Header | Select-String -Pattern '^\s*Class\s*=\s*([a-zA-Z0-9_\-]+)' | Select-Object -First 1
+            $ClassMatch = $Header | Select-String -Pattern '^\s*Class\s*=\s*"?([a-zA-Z0-9_\-]+)"?' |
+            Where-Object { $_.Line -notmatch 'ClassGuid' } | Select-Object -First 1
             
             if ($ClassMatch) {
                 $DriverClass = $ClassMatch.Matches[0].Groups[1].Value.Trim()
                 if ($BootCriticalClasses -contains $DriverClass) {
-                    $DestSubDir = Join-Path $BootDriverFolder $Inf.Directory.Name
+                    $FolderKey = "$($Inf.BaseName)_$([Math]::Abs($Inf.Directory.FullName.GetHashCode()))"
+                    $DestSubDir = Join-Path $BootDriverFolder $FolderKey
                     if (-not (Test-Path $DestSubDir)) {
                         Copy-Item -Path $Inf.Directory.FullName -Destination $DestSubDir -Recurse -Force -ErrorAction SilentlyContinue
                     }
@@ -316,10 +329,22 @@ if ($UseDriverInjection) {
 
 # Phase 4: Mounting ISO and copying
 Write-Host "`n[1/15] Mounting ISO and copying contents into the workspace..." -ForegroundColor Yellow
-$IsoImage = Mount-DiskImage -ImagePath $IsoPath -PassThru
-$IsoDrive = ($IsoImage | Get-Volume).DriveLetter + ":"
+$IsoImage = Mount-DiskImage -ImagePath $IsoPath -PassThru -ErrorAction Stop
+$DriveLetter = ($IsoImage | Get-Volume).DriveLetter
+if (-not $DriveLetter) {
+    Dismount-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "Failed to get drive letter from mounted ISO!" -ForegroundColor Red
+    Exit
+}
 
-robocopy "$IsoDrive\" "$ExtractDir" /E /MT:8 /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+$IsoDrive = "${DriveLetter}:"
+
+robocopy "$IsoDrive\" "$ExtractDir" /E /MT:8 /NFL /NDL /NJH /NJS /nc /ns /np
+if ($LASTEXITCODE -ge 8) {
+    Dismount-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "FATAL: robocopy failed (Exit code: $LASTEXITCODE)" -ForegroundColor Red
+    Exit 1
+}
 
 Dismount-DiskImage -ImagePath $IsoPath | Out-Null
 $InstallSystem = "wim"
@@ -339,6 +364,10 @@ if ($InstallSystem -eq "esd") {
     Write-Host "`n[!] Detected install.esd (Read-Only format). Converting Index $WimIndex to install.wim first..." -ForegroundColor Cyan
     $TempWim = "$ExtractDir\sources\install.wim"
     dism.exe /Export-Image /SourceImageFile:"$ExtractDir\sources\install.esd" /SourceIndex:$WimIndex /DestinationImageFile:"$TempWim" /Compress:fast
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path $TempWim)) {
+        Write-Host "FATAL: Failed to convert install.esd to install.wim (Exit code: $LASTEXITCODE)" -ForegroundColor Red
+        Exit 1
+    }
     Remove-Item -Path "$ExtractDir\sources\install.esd" -Force
     $InstallSystem = "wim"
     $WimIndex = "1"
@@ -346,6 +375,10 @@ if ($InstallSystem -eq "esd") {
 
 Write-Host "`n[3/15] Mounting install.wim (Index $WimIndex)..." -ForegroundColor Yellow
 dism.exe /Mount-Image /ImageFile:"$ExtractDir\sources\install.wim" /Index:$WimIndex /MountDir:"$MountDir" /Optimize
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FATAL: Failed to mount install.wim (Exit code: $LASTEXITCODE)" -ForegroundColor Red
+    Exit 1
+}
 
 Write-Host "`n[SCAN] Inspecting system inventory before debloat..." -ForegroundColor Cyan
 $CapabilityReport = Join-Path $Workspace "capabilities-before.txt"
@@ -371,6 +404,7 @@ Write-Host "  - CBS Packages found: $($PkgNames.Count) (Saved to packages-before
 Write-Host "  - Deep scanning hidden CBS Packages (Registry direct mapping)..." -ForegroundColor DarkGray
 $HiddenPkgReport = Join-Path $Workspace "hidden-packages-before.txt"
 
+Ensure-HiveUnloaded "zSOFTWARE"
 reg load HKLM\zSOFTWARE "$MountDir\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
 try {
     $CbsBaseKey = "zSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages"
@@ -389,7 +423,7 @@ try {
         $BaseHive.Close()
     }
 } finally {
-    reg unload HKLM\zSOFTWARE 2>$null | Out-Null
+    Ensure-HiveUnloaded "zSOFTWARE"
 }
 
 # Phase 6: Debloating
@@ -483,8 +517,9 @@ if (Test-Path $DmaPolicyJson) {
     icacls.exe "$DmaPolicyJson" /grant "*S-1-5-32-544:(F)" /C /Q 2>$null | Out-Null
     $JsonRaw = Get-Content -Path $DmaPolicyJson -Raw -Encoding UTF8
     $JsonRaw = $JsonRaw -replace '"defaultState"\s*:\s*"disabled"', '"defaultState": "enabled"'
-    $JsonRaw | Set-Content -Path $DmaPolicyJson -Encoding UTF8 -Force
+    [System.IO.File]::WriteAllText($DmaPolicyJson, $JsonRaw, (New-Object System.Text.UTF8Encoding $false))
 }
+
 
 $OptionalFeatures = @(
     "Printing-Foundation-InternetPrinting-Client",
@@ -505,10 +540,14 @@ $OptionalFeatures = @(
 $AvailableFeatures = Get-WindowsOptionalFeature -Path $MountDir -ErrorAction SilentlyContinue |
     Where-Object { $_.State -ne "DisabledWithPayloadRemoved" }
 
-foreach ($FeatName in $OptionalFeatures) {
-    if ($AvailableFeatures.FeatureName -contains $FeatName) {
-        Write-Host "  - Purging $FeatName" -ForegroundColor DarkGray
-        Disable-WindowsOptionalFeature -Path $MountDir -FeatureName $FeatName -Remove -NoRestart -ErrorAction SilentlyContinue | Out-Null
+if (-not $AvailableFeatures) {
+    Write-Host "  [!] Could not query optional features. Skipping." -ForegroundColor Yellow
+} else {
+    foreach ($FeatName in $OptionalFeatures) {
+        if ($AvailableFeatures.FeatureName -contains $FeatName) {
+            Write-Host "  - Purging $FeatName" -ForegroundColor DarkGray
+            Disable-WindowsOptionalFeature -Path $MountDir -FeatureName $FeatName -Remove -NoRestart -ErrorAction SilentlyContinue | Out-Null
+        }
     }
 }
 
@@ -526,18 +565,13 @@ $CapabilityPatterns = @(
     "OneCoreUAP.OneSync*",
     "Print.Management.Console*",
     "WMI-SNMP-Provider*",
+    "Language.Handwriting*",
+    "Language.OCR*",
+    "Language.Speech*",
+    "Language.TextToSpeech*",
+    "Rsat.*",
     "VBSCRIPT*"
 )
-
-if ($AggressiveDebloat -eq "Y") {
-    $CapabilityPatterns += @(
-        "Language.Handwriting*",
-        "Language.OCR*",
-        "Language.Speech*",
-        "Language.TextToSpeech*",
-        "Rsat.*"
-    )
-}
 
 $CurrentCapabilities = Get-WindowsCapability -Path $MountDir -ErrorAction SilentlyContinue |
     Where-Object { $_.State -eq "Installed" -and $_.Name -notlike "*Language.Basic*" }
@@ -580,23 +614,18 @@ $CbsTargetPatterns = @(
     "*FlipGridPWA*",
     "*OutlookPWA*",
     "*CEIPEnable*",
-    "*Recall*"
+    "*Recall*",
+    "*LanguageFeatures-Handwriting*",
+    "*LanguageFeatures-OCR*",
+    "*LanguageFeatures-Speech*",
+    "*LanguageFeatures-TextToSpeech*",
+    "*MediaPlayer*",
+    "*PowerShell-ISE*",
+    "*OpenSSH-Server*",
+    "*Application-Experience*",
+    "*Customer-Experience-Improvement*",
+    "*Windows-Error-Reporting*"
 )
-
-if ($AggressiveDebloat -eq "Y") {
-    $CbsTargetPatterns += @(
-        "*LanguageFeatures-Handwriting*",
-        "*LanguageFeatures-OCR*",
-        "*LanguageFeatures-Speech*",
-        "*LanguageFeatures-TextToSpeech*",
-        "*MediaPlayer*",
-        "*PowerShell-ISE*",
-        "*OpenSSH-Server*",
-        "*Application-Experience*",
-        "*Customer-Experience-Improvement*",
-        "*Windows-Error-Reporting*"
-    )
-}
 
 Write-Host "  - Unlocking CBS Registry locks (Visibility & Owners) for target packages..." -ForegroundColor Cyan
 Unlock-OfflineCbsPackages -MountPath $MountDir -TargetPatterns $CbsTargetPatterns
@@ -629,9 +658,15 @@ dism.exe /Image:"$MountDir" /Export-DefaultAppAssociations:"$AssocFile" | Out-Nu
 if (Test-Path $AssocFile) {
     $AssocContent = Get-Content -Path $AssocFile
     $CleanAssoc = $AssocContent | Where-Object { $_ -notmatch 'AppX|MicrosoftEdge|Zune|Bing|Xbox' }
-    $CleanAssoc | Set-Content -Path $AssocFile -Force
+    $CleanAssoc | Set-Content -Path $AssocFile -Encoding UTF8 -Force
     dism.exe /Image:"$MountDir" /Import-DefaultAppAssociations:"$AssocFile" | Out-Null
 }
+
+Ensure-HiveUnloaded "zCOMPONENTS"
+Ensure-HiveUnloaded "zDEFAULT"
+Ensure-HiveUnloaded "zNTUSER"
+Ensure-HiveUnloaded "zSOFTWARE"
+Ensure-HiveUnloaded "zSYSTEM"
 
 # Phase 9: Registry"ing"
 Write-Host "`n[9/15] Applying bypassing requirements & registry..." -ForegroundColor Yellow
@@ -733,9 +768,6 @@ try {
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' 'workCompleted' 'REG_DWORD' '1'
     Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate'
     Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
-    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' 'workCompleted' 'REG_DWORD' '1'
     Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe' 'OutlookUpdate'
     Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe' 'DevHomeUpdate'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Teams' 'DisableInstallation' 'REG_DWORD' '1'
@@ -762,7 +794,7 @@ try {
     
     Write-Output "  - Disabling OneDrive registries..."
     Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Active Setup\Installed Components\{8A69D345-D564-463c-AFF1-A69D9E530F96}'
-    Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\Run\OneDriveSetup'
+    Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\Run' 'OneDriveSetup'
     Set-RegistryValue "HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" "REG_DWORD" "1"
 
     Write-Output "  - Disabling Start Menu Iris recommendation..."
@@ -793,13 +825,11 @@ try {
     Remove-Item -Path "$tasksPath\Microsoft\Windows\Chkdsk\Proxy" -Force -ErrorAction SilentlyContinue
 }
 finally {
-    reg unload HKLM\zCOMPONENTS 2>$null | Out-Null
-    reg unload HKLM\zDEFAULT 2>$null | Out-Null
-    reg unload HKLM\zNTUSER 2>$null | Out-Null
-    reg unload HKLM\zSOFTWARE 2>$null | Out-Null
-    reg unload HKLM\zSYSTEM 2>$null | Out-Null
-    [GC]::Collect()
-    Start-Sleep -Seconds 3
+    Ensure-HiveUnloaded "zCOMPONENTS"
+    Ensure-HiveUnloaded "zDEFAULT"
+    Ensure-HiveUnloaded "zNTUSER"
+    Ensure-HiveUnloaded "zSOFTWARE"
+    Ensure-HiveUnloaded "zSYSTEM"
 }
 
 # Phase 10: Driver Injection
@@ -813,6 +843,8 @@ if ($UseDriverInjection) {
     }
 }
 
+Ensure-HiveUnloaded "zSOFTWARE"
+
 # Phase 11: ResetBase
 Write-Host "`n[11/15] Deep cleaning image components (ResetBase)..." -ForegroundColor Yellow
 
@@ -822,7 +854,7 @@ dism.exe /Image:"$MountDir" /Set-ReservedStorageState /State:Disabled /Quiet | O
 reg load HKLM\zSOFTWARE "$MountDir\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\SideBySide\Configuration' 'DisableResetbase' 'REG_DWORD' '0'
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\SideBySide\Configuration' 'SupersededActions' 'REG_DWORD' '1'
-reg unload HKLM\zSOFTWARE 2>$null | Out-Null
+Ensure-HiveUnloaded "zSOFTWARE"
 
 Write-Host "  - Executing DISM Component Cleanup & ResetBase..." -ForegroundColor Cyan
 dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup /ResetBase
@@ -833,9 +865,83 @@ Remove-Item -Path "$MountDir\Windows\WinSxS\InstallTemp\*" -Recurse -Force -Erro
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\DataStore\*" -Recurse -Force -ErrorAction SilentlyContinue
 
+if ($UseCustomWallpaper -eq "Y") {
+    Write-Host "`n[*] Downloading & replacing default 4K wallpapers and lock screen..." -ForegroundColor Yellow
+
+    $HomeWallUrl = "https://raw.githubusercontent.com/PastelPinkLab/Nautilus/main/Wallpaper/NautilusHome.jpg"
+    $LockWallUrl = "https://raw.githubusercontent.com/PastelPinkLab/Nautilus/main/Wallpaper/NautilusLock.jpg"
+    $TempHome    = "$Workspace\NautilusHome.jpg"
+    $TempLock    = "$Workspace\NautilusLock.jpg"
+
+    $Wall4KDir   = "$MountDir\Windows\Web\4K\Wallpaper\Windows"
+    $WallStdDir  = "$MountDir\Windows\Web\Wallpaper\Windows"
+    $ScreenDir   = "$MountDir\Windows\Web\Screen"
+
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    Invoke-WebRequest -Uri $HomeWallUrl -OutFile $TempHome -UseBasicParsing -ErrorAction Stop
+    if ((Test-Path $TempHome) -and ((Get-Item $TempHome).Length -gt 10240)) {
+        foreach ($Dir in @($Wall4KDir, $WallStdDir)) {
+            if (Test-Path $Dir) {
+                takeown.exe /F "$Dir" /R /A /D Y 2>$null | Out-Null
+                icacls.exe "$Dir" /grant "*S-1-5-32-544:(F)" /T /C /Q 2>$null | Out-Null
+            }
+        }
+
+        if (Test-Path $Wall4KDir) {
+            Get-ChildItem -Path $Wall4KDir -Filter "*.jpg" -File | ForEach-Object {
+                Set-ItemProperty -Path $_.FullName -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+                Copy-Item -Path $TempHome -Destination $_.FullName -Force
+            }
+            Write-Host "  - Replaced all 4K desktop wallpapers in Web\4K\Wallpaper\Windows" -ForegroundColor Green
+        }
+
+        if (Test-Path $WallStdDir) {
+            foreach ($FileName in @("img0.jpg", "img19.jpg")) {
+                $TargetFile = Join-Path $WallStdDir $FileName
+                if (Test-Path $TargetFile) {
+                    Set-ItemProperty -Path $TargetFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+                }
+                Copy-Item -Path $TempHome -Destination $TargetFile -Force
+            }
+            Write-Host "  - Replaced default img0.jpg & img19.jpg in Web\Wallpaper\Windows" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  [!] NautilusHome.jpg download invalid. Keeping default desktop wallpaper." -ForegroundColor Yellow
+    }
+
+    Invoke-WebRequest -Uri $LockWallUrl -OutFile $TempLock -UseBasicParsing -ErrorAction Stop
+    if ((Test-Path $TempLock) -and ((Get-Item $TempLock).Length -gt 10240)) {
+        if (Test-Path $ScreenDir) {
+            takeown.exe /F "$ScreenDir" /R /A /D Y 2>$null | Out-Null
+            icacls.exe "$ScreenDir" /grant "*S-1-5-32-544:(F)" /T /C /Q 2>$null | Out-Null
+
+            $LockTarget = Join-Path $ScreenDir "img100.jpg"
+            if (Test-Path $LockTarget) {
+                Set-ItemProperty -Path $LockTarget -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+            }
+            Copy-Item -Path $TempLock -Destination $LockTarget -Force
+            Write-Host "  - Replaced default Lock Screen (img100.jpg) in Web\Screen" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  [!] NautilusLock.jpg download invalid. Keeping default lock screen." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  [!] Failed to download wallpapers: $($_.Exception.Message). Keeping Windows defaults." -ForegroundColor Yellow
+}
+
+} else {
+    Write-Host "`n[*] Skipping custom wallpapers (keeping Windows defaults)." -ForegroundColor DarkGray
+}
+
 # Phase 12: Saving & Exporting
 Write-Host "`n[12/15] Saving changes to install.$InstallSystem..." -ForegroundColor Yellow
-dism.exe /Unmount-Image /MountDir:"$MountDir" /Commit | Out-Null
+dism.exe /Unmount-Image /MountDir:"$MountDir" /Commit
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FATAL: Failed to unmount install.wim (Exit code: $LASTEXITCODE)" -ForegroundColor Red
+    Exit 1
+}
 
 Write-Host "`n[!] Compression mode selected:" -ForegroundColor Cyan
 Write-Host "   [1] WIM (Fast but also recommended)" -ForegroundColor Cyan
@@ -849,23 +955,37 @@ $SourceFile = "$ExtractDir\sources\install.$InstallSystem"
 $OptimizedFile = "$ExtractDir\sources\install_optimized.$DestExt"
 
 Write-Host "  - Exporting and optimizing to install.$DestExt..." -ForegroundColor DarkGray
-dism.exe /Export-Image /SourceImageFile:$SourceFile /SourceIndex:$WimIndex /DestinationImageFile:$OptimizedFile /Compress:$CompressType | Out-Null
+dism.exe /Export-Image /SourceImageFile:"$SourceFile" /SourceIndex:$WimIndex /DestinationImageFile:"$OptimizedFile" /Compress:$CompressType | Out-Null
+if ($LASTEXITCODE -ne 0 -or !(Test-Path $OptimizedFile)) {
+    Write-Host "FATAL: Failed to export image (Exit code: $LASTEXITCODE)" -ForegroundColor Red
+    Exit 1
+}
 
 Remove-Item -Path $SourceFile -Force
 Rename-Item -Path $OptimizedFile -NewName "install.$DestExt"
 
 $InstallSystem = $DestExt
 
+Ensure-HiveUnloaded "zSYSTEM"
+
 # Phase 13: Bypass
 Write-Host "`n[13/15] Mounting boot.wim (Index 2) for Hardware Bypass & Storage Drivers..." -ForegroundColor Yellow
 dism.exe /Mount-Image /ImageFile:"$ExtractDir\sources\boot.wim" /Index:2 /MountDir:"$MountDir" /Optimize
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FATAL: Failed to mount boot.wim (Exit code: $LASTEXITCODE)" -ForegroundColor Red
+    Exit 1
+}
 
 if ($UseDriverInjection -and (Test-Path $BootDriverFolder)) {
     $BootInfCount = (Get-ChildItem -Path $BootDriverFolder -Recurse -Filter "*.inf" -File -ErrorAction SilentlyContinue | Measure-Object).Count
     if ($BootInfCount -gt 0) {
         Write-Host "  - Injecting $BootInfCount boot-critical drivers (NVMe/VMD/USB/Net) into WinPE..." -ForegroundColor Cyan
         dism.exe /Image:"$MountDir" /Add-Driver /Driver:"$BootDriverFolder" /Recurse /ForceUnsigned | Out-Null
-        Write-Host "  - WinPE driver injection completed." -ForegroundColor Green
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  [!] Warning: Some WinPE drivers failed to inject (Exit code: $LASTEXITCODE)" -ForegroundColor Yellow
+        } else {
+            Write-Host "  - WinPE driver injection completed." -ForegroundColor Green
+        }
     }
 }
 
@@ -881,11 +1001,15 @@ try {
         Set-RegistryValue 'HKLM\zSYSTEM\Setup\MoSetup' 'AllowUpgradesWithUnsupportedTPMOrCPU' 'REG_DWORD' '1'
     }
 } finally {
-    reg unload HKLM\zSYSTEM 2>$null | Out-Null
+    Ensure-HiveUnloaded "zSYSTEM"
 }
 
 Write-Host "`n[14/15] Saving changes to boot.wim..." -ForegroundColor Yellow
 dism.exe /Unmount-Image /MountDir:"$MountDir" /Commit
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FATAL: Failed to unmount boot.wim (Exit code: $LASTEXITCODE)" -ForegroundColor Red
+    Exit 1
+}
 
 # Phase 14: Autounattend.xml
 Write-Host "`n[15/15] Generating autounattend.xml..." -ForegroundColor Yellow
@@ -922,15 +1046,17 @@ $XmlContent = @"
                 </OSImage>
             </ImageInstall>
             <UserData>
+                <AcceptEula>true</AcceptEula>
                 <ProductKey>
-                    <Key/>
+                    <Key></Key>
+                    <WillShowUI>OnError</WillShowUI>
                 </ProductKey>
             </UserData>
         </component>
     </settings>
 </unattend>
 "@
-$XmlContent | Out-File -FilePath "$ExtractDir\autounattend.xml" -Encoding UTF8
+[System.IO.File]::WriteAllText("$ExtractDir\autounattend.xml", $XmlContent, (New-Object System.Text.UTF8Encoding $false))
 
 # Phase 15: Creating ISO files
 Write-Host "ISO Creation Process..." -ForegroundColor Yellow
@@ -955,15 +1081,23 @@ if (-not $OscdimgPath) {
 
 if (Test-Path $OscdimgPath) {
     Write-Host "Building ISO... (Please wait)" -ForegroundColor Cyan
-    $BuildArgs = "-m -o -u2 -udfver102 -bootdata:2#p0,e,b`"$ExtractDir\boot\etfsboot.com`"#pEF,e,b`"$ExtractDir\efi\microsoft\boot\efisys.bin`" `"$ExtractDir`" `"$FinalISO`""
+    $BuildArgs = "-m -o -u2 -udfver102 -bootdata:2#p0,e,bboot\etfsboot.com#pEF,e,befi\microsoft\boot\efisys.bin `"$ExtractDir`" `"$FinalISO`""
 
-    Start-Process -FilePath $OscdimgPath -ArgumentList $BuildArgs -Wait -NoNewWindow
-
-    Write-Host "`nCompleted! Your ISO is ready at: $FinalISO" -ForegroundColor Green
-    Write-Host "Cleaning up workspace..." -ForegroundColor DarkGray
-    Remove-Item -Path $Workspace -Recurse -Force
+    $Proc = Start-Process -FilePath $OscdimgPath -ArgumentList $BuildArgs -WorkingDirectory $ExtractDir -Wait -NoNewWindow -PassThru
+    if ($Proc.ExitCode -eq 0 -and (Test-Path $FinalISO)) {
+        Write-Host "`nCompleted! Your ISO is ready at: $FinalISO" -ForegroundColor Green
+    } else {
+        Write-Host "`n[!] oscdimg failed (Exit code: $($Proc.ExitCode)). Extracted files kept at: $ExtractDir" -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        Exit 1
+    }
 } else {
     Write-Host "`n[!] Cannot compress into ISO, your Windows path is: $ExtractDir" -ForegroundColor Yellow
+}
+
+$CleanupChoice = Read-Host "Delete workspace '$Workspace'? [Y/N] (Default: Y)"
+if ([string]::IsNullOrWhiteSpace($CleanupChoice) -or $CleanupChoice.Trim().ToUpperInvariant() -eq "Y") {
+    Remove-Item -Path $Workspace -Recurse -Force
 }
 
 Write-Host "`nPress Enter to exit..."
