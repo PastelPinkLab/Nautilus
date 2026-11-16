@@ -26,28 +26,19 @@ Building within pure performance for both low-end and high-end PCs, makes the pr
 #### APPXs
 - Clipchamp.Clipchamp
 - Microsoft.ApplicationCompatibilityEnhancements
-- Microsoft.AV1VideoExtension
-- Microsoft.AVCEncoderVideoExtension
 - Microsoft.BingNews
 - Microsoft.BingSearch
 - Microsoft.BingWeather
 - Microsoft.GamingApp
 - Microsoft.GetHelp
-- Microsoft.HEIFImageExtension
-- Microsoft.HEVCVideoExtension
 - Microsoft.MicrosoftOfficeHub
 - Microsoft.MicrosoftSolitaireCollection
 - Microsoft.MicrosoftStickyNotes
-- Microsoft.MPEG2VideoExtension
 - Microsoft.OutlookForWindows
 - Microsoft.Paint
 - Microsoft.PowerAutomateDesktop
-- Microsoft.RawImageExtension
 - Microsoft.ScreenSketch
 - Microsoft.Todos
-- Microsoft.VP9VideoExtensions
-- Microsoft.WebMediaExtensions
-- Microsoft.WebpImageExtension
 - Microsoft.Windows.DevHome
 - Microsoft.Windows.Photos
 - Microsoft.WindowsAlarms
@@ -80,7 +71,6 @@ Building within pure performance for both low-end and high-end PCs, makes the pr
 - SMB1Protocol-Server
 - SMB1Protocol-Deprecation
 - MSRDC-Infrastructure
-- WindowsMediaPlayer
 
 #### Capabilities (FOD)
 - App.StepsRecorder
@@ -90,7 +80,6 @@ Building within pure performance for both low-end and high-end PCs, makes the pr
 - Language.Speech
 - Language.TextToSpeech
 - MathRecognizer
-- Media.WindowsMediaPlayer
 - Microsoft.Wallpapers.Extended
 - Microsoft.Windows.PowerShell.ISE
 - OneCoreUAP.OneSync
