@@ -1,14 +1,18 @@
 # Registry helper functions
-
 function Ensure-HiveUnloaded([string]$HiveName) {
     $maxRetry = 5
     for ($i = 0; $i -lt $maxRetry; $i++) {
         $result = reg query "HKLM\$HiveName" 2>&1
-        if ($LASTEXITCODE -ne 0) { return } # Already unloaded
+        if ($LASTEXITCODE -ne 0) { return }
         [GC]::Collect()
         [GC]::WaitForPendingFinalizers()
         Start-Sleep -Milliseconds 500
         reg unload "HKLM\$HiveName" 2>$null | Out-Null
+    }
+
+    reg query "HKLM\$HiveName" 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  [!] WARNING: Failed to unload HKLM\$HiveName after $maxRetry retries!" -ForegroundColor Red
     }
 }
 
@@ -67,6 +71,7 @@ function Unlock-OfflineCbsPackages {
         $AdminSID, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
     )
 
+    Ensure-HiveUnloaded "zSOFTWARE"
     reg load HKLM\zSOFTWARE "$MountPath\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
     try {
         $CbsBaseKey = "zSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages"
@@ -139,9 +144,9 @@ function Get-OscdimgPath {
     $candidates = @(
         "$env:SystemRoot\System32\oscdimg.exe",
         "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
-        "$env:ProgramFiles(x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
         "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\Oscdimg\oscdimg.exe",
-        "$env:ProgramFiles(x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\Oscdimg\oscdimg.exe"
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\Oscdimg\oscdimg.exe"
     )
 
     foreach ($candidate in $candidates) {
@@ -156,6 +161,191 @@ function Get-OscdimgPath {
     }
 
     return $null
+}
+
+function Invoke-AutoWindowsUpdate {
+    param (
+        [string]$MountPath,
+        [int]$Build,
+        [int]$UBR,
+        [string]$DisplayVersion,
+        [string]$CacheDir
+    )
+
+    Write-Host "`n[3.14159/15] Auto-checking and Integrating Latest Windows Updates..." -ForegroundColor Yellow
+    Write-Host "  - Detected base OS: Windows 11 ($DisplayVersion) Build $Build.$UBR, seems pretty new :D" -ForegroundColor Cyan
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+    $CurYear  = (Get-Date).Year
+    $PrevYear = $CurYear - 1
+    $SearchQueries = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($DisplayVersion)) {
+        $SearchQueries += "$CurYear Cumulative Update for Windows 11 version $DisplayVersion x64"
+        $SearchQueries += "$PrevYear Cumulative Update for Windows 11 version $DisplayVersion x64"
+        $SearchQueries += "Cumulative Update for Windows 11 version $DisplayVersion x64"
+    }
+    $SearchQueries += "$CurYear Cumulative Update for Windows 11 $Build x64"
+    $SearchQueries += "Cumulative Update for Windows 11 $Build x64"
+
+    $candidates = @()
+    foreach ($SearchTerm in $SearchQueries) {
+        $SearchUrl = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + [Uri]::EscapeDataString($SearchTerm)
+        Write-Host "  - Querying Microsoft Update Catalog ($SearchTerm)..." -ForegroundColor DarkGray
+        try {
+            $req = Invoke-WebRequest -Uri $SearchUrl -UseBasicParsing -TimeoutSec 25
+        } catch {
+            Write-Host "  [!] Warning: Failed to connect to Microsoft Update Catalog ($($_.Exception.Message))." -ForegroundColor Yellow
+            continue
+        }
+
+        $rows = [regex]::Matches($req.Content, "(?is)<a[^>]+id=['""]([0-9a-f\-]{36})_link['""][^>]*>(.*?)</a>")
+        foreach ($m in $rows) {
+            $title = ($m.Groups[2].Value -replace '<[^>]+>', '' -replace '\s+', ' ').Trim()
+            $um = [regex]::Match($title, "\($Build\.(\d+)\)")
+            $km = [regex]::Match($title, "(KB\d+)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+            if ($um.Success -and
+                $title -match '(Cumulative|Security) Update' -and
+                $title -notmatch 'Preview|Server|ARM64|x86|Dynamic Update|\.NET') {
+                $candidates += [PSCustomObject]@{
+                    Guid  = $m.Groups[1].Value
+                    Title = $title
+                    UBR   = [int]$um.Groups[1].Value
+                    KB    = if ($km.Success) { $km.Groups[1].Value.ToLowerInvariant() } else { "" }
+                }
+            }
+        }
+        if (($candidates | Where-Object { $_.UBR -gt $UBR }).Count -gt 0) { break }
+    }
+
+    $latestLcu = $candidates | Sort-Object UBR -Descending | Select-Object -First 1
+    if (-not $latestLcu) {
+        Write-Host "  - No newer LCU matched on Catalog for Build $Build. Skipping update." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "  - Latest Catalog LCU: $($latestLcu.Title)" -ForegroundColor Cyan
+    if ($latestLcu.UBR -le $UBR) {
+        Write-Host "  - Image revision ($UBR) is already up to date (>= $($latestLcu.UBR)). Skipping." -ForegroundColor Green
+        return
+    }
+
+    Write-Host "  - Update available: $Build.$UBR -> $Build.$($latestLcu.UBR)" -ForegroundColor Green
+    $TargetFolder = Join-Path $CacheDir "${Build}_$($latestLcu.UBR)"
+    if (-not (Test-Path $TargetFolder)) {
+        New-Item -ItemType Directory -Force -Path $TargetFolder | Out-Null
+    }
+
+    Write-Host "  - Resolving Microsoft CDN download links..." -ForegroundColor DarkGray
+    $payload = ConvertTo-Json -InputObject @(@{ size = 0; updateID = $latestLcu.Guid; uidInfo = $latestLcu.Guid }) -Compress
+    try {
+        $dlg = Invoke-WebRequest -Uri "https://www.catalog.update.microsoft.com/DownloadDialog.aspx" -Method Post `
+                                -Body @{ updateIDs = $payload } `
+                                -ContentType "application/x-www-form-urlencoded" `
+                                -UseBasicParsing `
+                                -Headers @{ Referer = "https://www.catalog.update.microsoft.com/" } `
+                                -TimeoutSec 25
+    } catch {
+        Write-Host "  [!] Warning: Failed to resolve download links ($($_.Exception.Message)). Skipping update." -ForegroundColor Yellow
+        return
+    }
+
+    $urls = @(
+        [regex]::Matches($dlg.Content, 'https?://[^\s<>''"]+?\.(?:msu|cab)') |
+        ForEach-Object { $_.Value } |
+        Where-Object { $_ -notmatch 'arm64' } |
+        Select-Object -Unique
+    )
+    if ($urls.Count -eq 0) {
+        Write-Host "  [!] Warning: No .msu/.cab links found. Skipping." -ForegroundColor Yellow
+        return
+    }
+
+    $DownloadedCount = 0
+    foreach ($url in $urls) {
+        $fileName = [System.IO.Path]::GetFileName(([Uri]$url).LocalPath)
+        $destPath = Join-Path $TargetFolder $fileName
+        $tmpPath  = "$destPath.tmp"
+
+        if ((Test-Path $destPath) -and ((Get-Item $destPath).Length -gt 102400)) {
+            $sizeMb = [Math]::Round((Get-Item $destPath).Length / 1MB, 1)
+            Write-Host "  - [Cache] Reusing $fileName ($sizeMb MB)" -ForegroundColor Green
+            $DownloadedCount++
+            continue
+        }
+
+        if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue }
+        Write-Host "  - Downloading $fileName..." -ForegroundColor Cyan
+
+        $ok = $false
+        if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+            & curl.exe -L --fail --retry 3 --retry-delay 5 --connect-timeout 30 -o "$tmpPath" "$url"
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $tmpPath) -and ((Get-Item $tmpPath).Length -gt 102400)) {
+                $ok = $true
+            }
+        }
+
+        if (-not $ok) {
+            Write-Host "  [!] curl failed or unavailable, falling back to BITS/WebClient for $fileName..." -ForegroundColor DarkGray
+            try {
+                if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+                    Start-BitsTransfer -Source $url -Destination $tmpPath -DisplayName "Nautilus Update: $fileName" -ErrorAction Stop
+                } else {
+                    $wc = New-Object System.Net.WebClient
+                    $wc.DownloadFile($url, $tmpPath)
+                }
+                $ok = (Test-Path $tmpPath) -and ((Get-Item $tmpPath).Length -gt 102400)
+            } catch {
+                Write-Host "  [!] Download failed for $fileName`: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+
+        if ($ok) {
+            Move-Item -Path $tmpPath -Destination $destPath -Force
+            $sizeMb = [Math]::Round((Get-Item $destPath).Length / 1MB, 1)
+            Write-Host "  - Downloaded $fileName ($sizeMb MB)" -ForegroundColor Green
+            $DownloadedCount++
+        } else {
+            if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    if ($DownloadedCount -lt $urls.Count) {
+        Write-Host "  [!] Incomplete update download ($DownloadedCount/$($urls.Count)). Skipping integration to avoid broken dependencies." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "  - Integrating update package(s) into install.wim (this may take several minutes)..." -ForegroundColor Cyan
+
+    $mainMsu = $null
+    if (-not [string]::IsNullOrWhiteSpace($latestLcu.KB)) {
+        $mainMsu = Get-ChildItem -Path $TargetFolder -Filter "*$($latestLcu.KB)*.msu" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+
+    if ($mainMsu) {
+        Write-Host "  - Applying target LCU (with checkpoints auto-resolved): $($mainMsu.Name)" -ForegroundColor DarkGray
+        dism.exe /Image:"$MountPath" /Add-Package /PackagePath:"$($mainMsu.FullName)" /Quiet /NoRestart
+        $exitCode = $LASTEXITCODE
+    } else {
+        $pkgFiles = Get-ChildItem -Path $TargetFolder -File | Where-Object { $_.Extension -in @('.msu', '.cab') } | Sort-Object {
+            $m = [regex]::Match($_.Name, 'kb(\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($m.Success) { [long]$m.Groups[1].Value } else { 0 }
+        }
+        $exitCode = 0
+        foreach ($pkg in $pkgFiles) {
+            Write-Host "  - Applying $($pkg.Name)..." -ForegroundColor DarkGray
+            dism.exe /Image:"$MountPath" /Add-Package /PackagePath:"$($pkg.FullName)" /Quiet /NoRestart
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { $exitCode = $LASTEXITCODE }
+        }
+    }
+
+    if ($exitCode -eq 0 -or $exitCode -eq 3010) {
+        Write-Host "  - Windows Updates integrated smoothly! Smoooooth operator :D" -ForegroundColor Green
+    } else {
+        Write-Host "  [!] DISM /Add-Package exited with code $exitCode. Continuing build..." -ForegroundColor Yellow
+    }
 }
 
 # Phase 1: Administrator privileges
@@ -238,6 +428,10 @@ $HardwareBypass = Read-Host "-> Enable hardware bypass (TPM/CPU/Secure Boot)? [Y
 if ([string]::IsNullOrWhiteSpace($HardwareBypass)) { $HardwareBypass = "N" }
 $HardwareBypass = $HardwareBypass.Trim().ToUpperInvariant()
 
+$AutoUpdateInput = Read-Host "-> Auto-download & integrate latest Windows Updates? [Y/N] (Default: N)"
+if ([string]::IsNullOrWhiteSpace($AutoUpdateInput)) { $AutoUpdateInput = "N" }
+$UseAutoUpdate = ($AutoUpdateInput.Trim().ToUpperInvariant() -eq "Y")
+
 $UseCustomWallpaper = Read-Host "-> Download & apply Nautilus wallpapers? [Y/N] (Default: Y)"
 if ([string]::IsNullOrWhiteSpace($UseCustomWallpaper)) { $UseCustomWallpaper = "Y" }
 $UseCustomWallpaper = $UseCustomWallpaper.Trim().ToUpperInvariant()
@@ -253,6 +447,7 @@ Write-Host "  - Output ISO: $FinalISO" -ForegroundColor DarkGray
 Write-Host "  - Compression: $CompressionChoice" -ForegroundColor DarkGray
 Write-Host "  - Drivers: $DriverDisplay" -ForegroundColor DarkGray
 Write-Host "  - Hardware bypass: $HardwareBypass" -ForegroundColor DarkGray
+Write-Host "  - Windows Updates: $(if ($UseAutoUpdate) { 'Auto-download & Integrate' } else { 'Disabled' })" -ForegroundColor DarkGray
 Write-Host "  - Custom wallpapers: $UseCustomWallpaper" -ForegroundColor DarkGray
 Write-Host "============================================"
 Write-Host ""
@@ -272,6 +467,9 @@ reg unload HKLM\zDEFAULT 2>$null | Out-Null
 reg unload HKLM\zNTUSER 2>$null | Out-Null
 reg unload HKLM\zSOFTWARE 2>$null | Out-Null
 reg unload HKLM\zSYSTEM 2>$null | Out-Null
+if (Test-Path "$MountDir\Windows") {
+    dism.exe /Unmount-Image /MountDir:"$MountDir" /Discard /Quiet | Out-Null
+}
 dism.exe /Cleanup-Wim /Quiet | Out-Null
 dism.exe /Cleanup-Mountpoints /Quiet | Out-Null
 
@@ -309,7 +507,7 @@ if ($UseDriverInjection) {
         $AllInfs = Get-ChildItem -Path $DriverFolder -Recurse -Filter "*.inf" -File -ErrorAction SilentlyContinue
         
         foreach ($Inf in $AllInfs) {
-            $Header = Get-Content -Path $Inf.FullName -TotalCount 60 -ErrorAction SilentlyContinue
+            $Header = Get-Content -Path $Inf.FullName -TotalCount 300 -ErrorAction SilentlyContinue
             $ClassMatch = $Header | Select-String -Pattern '^\s*Class\s*=\s*"?([a-zA-Z0-9_\-]+)"?' |
             Where-Object { $_.Line -notmatch 'ClassGuid' } | Select-Object -First 1
             
@@ -365,7 +563,7 @@ if ($InstallSystem -eq "esd") {
     $TempWim = "$ExtractDir\sources\install.wim"
     dism.exe /Export-Image /SourceImageFile:"$ExtractDir\sources\install.esd" /SourceIndex:$WimIndex /DestinationImageFile:"$TempWim" /Compress:fast
     if ($LASTEXITCODE -ne 0 -or !(Test-Path $TempWim)) {
-        Write-Host "FATAL: Failed to convert install.esd to install.wim (Exit code: $LASTEXITCODE)" -ForegroundColor Red
+        Write-Host "FATAL: Failed to convert install.esd to install.wim :( (Exit code: $LASTEXITCODE)" -ForegroundColor Red
         Exit 1
     }
     Remove-Item -Path "$ExtractDir\sources\install.esd" -Force
@@ -380,30 +578,66 @@ if ($LASTEXITCODE -ne 0) {
     Exit 1
 }
 
-Write-Host "`n[SCAN] Inspecting system inventory before debloat..." -ForegroundColor Cyan
-$CapabilityReport = Join-Path $Workspace "capabilities-before.txt"
-$FeatureReport    = Join-Path $Workspace "features-before.txt"
-$PackageReport    = Join-Path $Workspace "packages-before.txt"
+if ($UseAutoUpdate) {
+    $WorkspaceParent = Split-Path ($Workspace.TrimEnd('\')) -Parent
+    if ([string]::IsNullOrWhiteSpace($WorkspaceParent)) { $WorkspaceParent = $Workspace }
+    $UpdateCacheDir = Join-Path $WorkspaceParent "NautilusUpdatesCache"
 
-$InstalledCapabilities = Get-WindowsCapability -Path $MountDir -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Installed" }
-if ($InstalledCapabilities) {
+    $CurBuild = 0; $CurUBR = 0; $CurDisp = ""
+    Ensure-HiveUnloaded "zSOFTWARE"
+    try {
+        reg load HKLM\zSOFTWARE "$MountDir\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
+        $CurProp = Get-ItemProperty -Path "HKLM:\zSOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+        if ($CurProp.CurrentBuild) { $CurBuild = [int]$CurProp.CurrentBuild }
+        if ($null -ne $CurProp.UBR) { $CurUBR = [int]$CurProp.UBR }
+        if ($CurProp.DisplayVersion) { $CurDisp = [string]$CurProp.DisplayVersion }
+    } finally {
+        Ensure-HiveUnloaded "zSOFTWARE"
+    }
+
+    if ($CurBuild -gt 0) {
+        Invoke-AutoWindowsUpdate -MountPath $MountDir -Build $CurBuild -UBR $CurUBR -DisplayVersion $CurDisp -CacheDir $UpdateCacheDir
+    } else {
+        Write-Host "`n[!] Could not read OS build from mounted image. Skipping auto-update." -ForegroundColor Yellow
+    }
+}
+
+Write-Host "`n[SCAN] Inspecting system inventory before debloat..." -ForegroundColor Cyan
+$CapabilityReport      = Join-Path $Workspace "capabilities-before.txt"
+$FeatureReport         = Join-Path $Workspace "features-before.txt"
+$PackageReport         = Join-Path $Workspace "packages-before.txt"
+$HiddenPkgReport       = Join-Path $Workspace "hidden-packages-before.txt"
+$AppxReport            = Join-Path $Workspace "appx-before.txt"
+
+$InstalledCapabilities = @(Get-WindowsCapability -Path $MountDir -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Installed" })
+if ($InstalledCapabilities.Count -gt 0) {
     $InstalledCapabilities.Name | Out-File -FilePath $CapabilityReport -Encoding UTF8
     Write-Host "  - Capabilities found: $($InstalledCapabilities.Count) (Saved to capabilities-before.txt)" -ForegroundColor DarkGray
 }
-$InstalledFeatures = Get-WindowsOptionalFeature -Path $MountDir -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Enabled" }
-if ($InstalledFeatures) {
+
+$InstalledFeatures = @(Get-WindowsOptionalFeature -Path $MountDir -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Enabled" })
+if ($InstalledFeatures.Count -gt 0) {
     $InstalledFeatures.FeatureName | Out-File -FilePath $FeatureReport -Encoding UTF8
     Write-Host "  - Optional Features found: $($InstalledFeatures.Count) (Saved to features-before.txt)" -ForegroundColor DarkGray
 }
 
 $PackageScan = dism.exe /Image:"$MountDir" /Get-Packages /English
 $PackageScan | Out-File -FilePath $PackageReport -Encoding UTF8
-$PkgNames = $PackageScan | Select-String "Package Identity : " | ForEach-Object { $_.Line.Replace("Package Identity : ", "").Trim() }
+$PkgNames = @($PackageScan | Select-String "Package Identity : " | ForEach-Object { $_.Line.Replace("Package Identity : ", "").Trim() })
 Write-Host "  - CBS Packages found: $($PkgNames.Count) (Saved to packages-before.txt)" -ForegroundColor DarkGray
 
-Write-Host "  - Deep scanning hidden CBS Packages (Registry direct mapping)..." -ForegroundColor DarkGray
-$HiddenPkgReport = Join-Path $Workspace "hidden-packages-before.txt"
+$AppxScan = @(Get-AppxProvisionedPackage -Path $MountDir -ErrorAction SilentlyContinue)
+if ($AppxScan.Count -gt 0) {
+    $AppxScan | ForEach-Object {
+        $Fam = if ($_.PublisherId) { "$($_.DisplayName)_$($_.PublisherId)" } else { $_.DisplayName }
+        "$($_.DisplayName) | $Fam | $($_.PackageName)"
+    } | Out-File -FilePath $AppxReport -Encoding UTF8
+    Write-Host "  - Provisioned AppX found: $($AppxScan.Count) (Saved to appx-before.txt)" -ForegroundColor DarkGray
+} else {
+    Write-Host "  - Provisioned AppX found: 0" -ForegroundColor DarkGray
+}
 
+Write-Host "  - Deep scanning hidden CBS & Inbox/System UWP (Registry direct mapping)..." -ForegroundColor DarkGray
 Ensure-HiveUnloaded "zSOFTWARE"
 reg load HKLM\zSOFTWARE "$MountDir\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
 try {
@@ -411,25 +645,21 @@ try {
     $BaseHive = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($CbsBaseKey)
     if ($BaseHive) {
         $AllPkgNames = $BaseHive.GetSubKeyNames()
-        
-        $FilteredPkgs = $AllPkgNames | Where-Object {
+        $FilteredPkgs = @($AllPkgNames | Where-Object {
             $_ -notlike "Package_for_RollupFix*" -and
             $_ -notlike "Package_for_ServicingStack*" -and
             $_ -notlike "Package_for_KB*"
-        }
-        
+        })
         $FilteredPkgs | Out-File -FilePath $HiddenPkgReport -Encoding UTF8
         Write-Host "  - Hidden/Deep CBS Packages found: $($FilteredPkgs.Count) (Saved to hidden-packages-before.txt)" -ForegroundColor DarkGray
         $BaseHive.Close()
+        $BaseHive = $null
     }
 } finally {
     Ensure-HiveUnloaded "zSOFTWARE"
 }
 
 # Phase 6: Debloating
-
-$AdminGroup = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([System.Security.Principal.NTAccount]).Value
-
 Write-Host "`n[4/15] Debloating system apps..." -ForegroundColor Yellow
 
 Write-Host "  - Dynamically scanning and removing UWP/APPX apps..."
@@ -437,12 +667,23 @@ Write-Host "  - Dynamically scanning and removing UWP/APPX apps..."
 $KeepApps = @(
     "Microsoft.DesktopAppInstaller",
     "Microsoft.NET.Native",
-    "Microsoft.SecHealthUI",
+    "SecHealthUI",
+    "Microsoft.WindowsStore",
     "Microsoft.Services.Store.Engagement",
     "Microsoft.StorePurchaseApp",
     "Microsoft.UI.Xaml",
     "Microsoft.VCLibs",
-    "Microsoft.WindowsAppRuntime"
+    "Microsoft.WindowsAppRuntime",
+
+    # Extensions or... whatever
+    "Microsoft.AV1VideoExtension",
+    "Microsoft.AVCEncoderVideoExtension",
+    "Microsoft.HEIFImageExtension",
+    "Microsoft.HEVCVideoExtension",
+    "Microsoft.MPEG2VideoExtension",
+    "Microsoft.VP9VideoExtensions",
+    "Microsoft.WebMediaExtensions",
+    "Microsoft.WebpImageExtension"
 )
 
 $InstalledAppx = Get-AppxProvisionedPackage -Path $MountDir -ErrorAction SilentlyContinue
@@ -462,9 +703,6 @@ foreach ($App in $InstalledAppx) {
     }
 }
 
-Write-Host "  - Optimizing remaining AppX packages (Hardlink deduplication)..." -ForegroundColor Cyan
-dism.exe /Image:"$MountDir" /Optimize-ProvisionedAppxPackages /Quiet | Out-Null
-
 Write-Host "`n[5/15] Removing Edge and OneDrive..." -ForegroundColor Yellow
 
 $EdgePaths = @(
@@ -476,10 +714,14 @@ $EdgePaths = @(
 
 foreach ($Path in $EdgePaths) {
     if (Test-Path $Path) {
-        Write-Host "  - Removed $Path" -ForegroundColor DarkGray
         takeown.exe /F $Path /R /A /D Y 2>$null | Out-Null
-        icacls.exe $Path /grant "$($AdminGroup):(F)" /T /C /Q 2>$null | Out-Null
+        icacls.exe $Path /grant "*S-1-5-32-544:(F)" /T /C /Q 2>$null | Out-Null
         Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
+        if (!(Test-Path $Path)) {
+            Write-Host "  - Removed $Path" -ForegroundColor DarkGray
+        } else {
+            Write-Host "  - Failed to remove $Path" -ForegroundColor Red
+        }
     }
 }
 
@@ -492,10 +734,10 @@ foreach ($Path in $OneDrivePaths) {
     if (Test-Path $Path) {
         if ((Get-Item $Path) -is [System.IO.DirectoryInfo]) {
             takeown.exe /F $Path /R /A /D Y 2>$null | Out-Null
-            icacls.exe $Path /grant "$($AdminGroup):(F)" /T /C /Q 2>$null | Out-Null
+            icacls.exe $Path /grant "*S-1-5-32-544:(F)" /T /C /Q 2>$null | Out-Null
         } else {
             takeown.exe /F $Path /A 2>$null | Out-Null
-            icacls.exe $Path /grant "$($AdminGroup):(F)" /C /Q 2>$null | Out-Null
+            icacls.exe $Path /grant "*S-1-5-32-544:(F)" /C /Q 2>$null | Out-Null
         }
         
         Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
@@ -532,9 +774,7 @@ $OptionalFeatures = @(
     "SMB1Protocol-Deprecation",
     "MicrosoftWindowsPowerShellV2",
     "MicrosoftWindowsPowerShellV2Root",
-    "MSRDC-Infrastructure",
-    "MediaPlayback",
-    "WindowsMediaPlayer"
+    "MSRDC-Infrastructure"
 )
 
 $AvailableFeatures = Get-WindowsOptionalFeature -Path $MountDir -ErrorAction SilentlyContinue |
@@ -558,7 +798,6 @@ $CapabilityPatterns = @(
     "App.Support.QuickAssist*",
     "Browser.InternetExplorer*",
     "MathRecognizer*",
-    "Media.WindowsMediaPlayer*",
     "Microsoft.Wallpapers.Extended*",
     "Microsoft.Windows.PowerShell.ISE*",
     "Microsoft.Windows.WordPad*",
@@ -619,12 +858,10 @@ $CbsTargetPatterns = @(
     "*LanguageFeatures-OCR*",
     "*LanguageFeatures-Speech*",
     "*LanguageFeatures-TextToSpeech*",
-    "*MediaPlayer*",
     "*PowerShell-ISE*",
     "*OpenSSH-Server*",
-    "*Application-Experience*",
     "*Customer-Experience-Improvement*",
-    "*Windows-Error-Reporting*"
+    "*MicrosoftEdgeDevToolsClient*"
 )
 
 Write-Host "  - Unlocking CBS Registry locks (Visibility & Owners) for target packages..." -ForegroundColor Cyan
@@ -643,7 +880,7 @@ $UnlockedPackages = Get-WindowsPackage -Path $MountDir -ErrorAction SilentlyCont
 foreach ($Pkg in $UnlockedPackages) {
     foreach ($Pattern in $CbsTargetPatterns) {
         if ($Pkg.PackageName -like $Pattern) {
-            Write-Host "  - [DISM CBS] Purging $($Pkg.PackageState) package: $($Pkg.PackageName)" -ForegroundColor DarkGray
+            Write-Host "  - Purged $($Pkg.PackageState) package: $($Pkg.PackageName)" -ForegroundColor DarkGray
             dism.exe /Image:"$MountDir" /Remove-Package /PackageName:"$($Pkg.PackageName)" /Quiet /NoRestart | Out-Null
             break
         }
@@ -657,7 +894,7 @@ $AssocFile = "$Workspace\appassoc.xml"
 dism.exe /Image:"$MountDir" /Export-DefaultAppAssociations:"$AssocFile" | Out-Null
 if (Test-Path $AssocFile) {
     $AssocContent = Get-Content -Path $AssocFile
-    $CleanAssoc = $AssocContent | Where-Object { $_ -notmatch 'AppX|MicrosoftEdge|Zune|Bing|Xbox' }
+    $CleanAssoc = $AssocContent | Where-Object { $_ -notmatch 'MicrosoftEdge|Zune|Bing|Xbox' }
     $CleanAssoc | Set-Content -Path $AssocFile -Encoding UTF8 -Force
     dism.exe /Image:"$MountDir" /Import-DefaultAppAssociations:"$AssocFile" | Out-Null
 }
@@ -677,19 +914,21 @@ try {
     reg load HKLM\zSOFTWARE "$MountDir\Windows\System32\config\SOFTWARE" | Out-Null
     reg load HKLM\zSYSTEM "$MountDir\Windows\System32\config\SYSTEM" | Out-Null
 
-    Write-Host "  - Bypassing Hardware Requirements..."
-    Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' 'SV1' 'REG_DWORD' '0'
-    Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' 'SV2' 'REG_DWORD' '0'
-    Set-RegistryValue 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' 'SV1' 'REG_DWORD' '0'
-    Set-RegistryValue 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' 'SV2' 'REG_DWORD' '0'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassCPUCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassRAMCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassSecureBootCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassStorageCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassTPMCheck' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSYSTEM\Setup\MoSetup' 'AllowUpgradesWithUnsupportedTPMOrCPU' 'REG_DWORD' '1'
-    
-    Write-Host "  - Disabling Sponsored Apps & Content Delivery..."
+    if ($HardwareBypass -eq "Y") {
+        # Bypassing
+        Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' 'SV1' 'REG_DWORD' '0'
+        Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' 'SV2' 'REG_DWORD' '0'
+        Set-RegistryValue 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' 'SV1' 'REG_DWORD' '0'
+        Set-RegistryValue 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' 'SV2' 'REG_DWORD' '0'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassCPUCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassRAMCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassSecureBootCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassStorageCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\LabConfig' 'BypassTPMCheck' 'REG_DWORD' '1'
+        Set-RegistryValue 'HKLM\zSYSTEM\Setup\MoSetup' 'AllowUpgradesWithUnsupportedTPMOrCPU' 'REG_DWORD' '1'
+    }
+
+    # Disabling Content Delivery
     Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'OemPreInstalledAppsEnabled' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'PreInstalledAppsEnabled' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'PreInstalledAppsEverEnabled' 'REG_DWORD' '0'
@@ -711,32 +950,26 @@ try {
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsConsumerFeatures' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableConsumerAccountStateContent' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableCloudOptimizedContent' 'REG_DWORD' '1'
-    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\PolicyManager\current\device\Start' 'ConfigureStartPins' 'REG_SZ' '{\"pinnedList\": [{}]}'
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\PolicyManager\current\device\Start' 'ConfigureStartPins' 'REG_SZ' '{\"pinnedList\": []}'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\PushToInstall' 'DisablePushToInstall' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\MRT' 'DontOfferThroughWUAU' 'REG_DWORD' '1'
     Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\Subscriptions'
     Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SuggestedApps'
     
-    Write-Output "  - Enabling Local Accounts on OOBE..."
-    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' 'OOBELocalAccount' 'REG_SZ' 'start ms-cxh:localonly'
+    # Enabling Local Accounts
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'BypassNRO' 'REG_DWORD' '1'
     
-    Write-Output "  - Disabling Reserved Storage..."
+    # Disabling Reserved Storage
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' 'ShippedWithReserves' 'REG_DWORD' '0'
     
-    Write-Output "  - Disabling BitLocker Device Encryption..."
+    # BitLocker
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Control\BitLocker' 'PreventDeviceEncryption' 'REG_DWORD' '1'
     
-    Write-Output "  - Disabling Services..."
+    # Disabling Services..."
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\SysMain' 'Start' 'REG_DWORD' '4'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\DiagTrack' 'Start' 'REG_DWORD' '4'
-    Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\DPS' 'Start' 'REG_DWORD' '4'
-    Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\WdiServiceHost' 'Start' 'REG_DWORD' '4'
-    Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\WdiSystemHost' 'Start' 'REG_DWORD' '4'
-    Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\PcaSvc' 'Start' 'REG_DWORD' '4'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\TrkWks' 'Start' 'REG_DWORD' '4'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\MapsBroker' 'Start' 'REG_DWORD' '4'
-    Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\WerSvc' 'Start' 'REG_DWORD' '4'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\SDRSVC' 'Start' 'REG_DWORD' '4'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\wbengine' 'Start' 'REG_DWORD' '4'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\fhsvc' 'Start' 'REG_DWORD' '4'
@@ -746,11 +979,11 @@ try {
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\RetailDemo' 'Start' 'REG_DWORD' '4'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\shpamsvc' 'Start' 'REG_DWORD' '4'
 
-    Write-Output "  - Disabling Chat..."
+    # Disabling Chat
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Chat' 'ChatIcon' 'REG_DWORD' '3'
     Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarMn' 'REG_DWORD' '0'
     
-    Write-Output "  - Disabling Telemetry..."
+    # Disabling Telemetry
     Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' 'HasAccepted' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Input\TIPC' 'Enabled' 'REG_DWORD' '0'
@@ -762,24 +995,20 @@ try {
     Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\dmwappushservice' 'Start' 'REG_DWORD' '4'
     
-    Write-Output "  - Preventing installation of apps..."
+    # Preventing installation of apps
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' 'workCompleted' 'REG_DWORD' '1'
-    Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate'
-    Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
-    Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe' 'OutlookUpdate'
-    Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe' 'DevHomeUpdate'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Teams' 'DisableInstallation' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Mail' 'PreventRun' 'REG_DWORD' '1'
     
-    Write-Output "  - Disabling Folder Auto Discovery..."
+    # Disabling Folder Auto Discovery=
     Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags\AllFolders\Shell' 'FolderType' 'REG_SZ' 'NotSpecified'
     
-    Write-Output "  - Disabling Search Highlights..."
+    # Disabling Search Highlights
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings' 'IsDynamicSearchBoxEnabled' 'REG_DWORD' '0'
     
-    Write-Output "  - Disabling Bing..."
+    # Disabling Bing
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Search' 'ConnectedSearchUseWeb' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Search' 'DisableWebSearch' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 'REG_DWORD' '0'
@@ -787,36 +1016,35 @@ try {
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Feeds' 'EnableFeeds' 'REG_DWORD' '0'
     
-    Write-Output "  - Disabling Copilot..."
+    # Disabling Copilot
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Edge' 'HubsSidebarEnabled' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 'REG_DWORD' '1'
     
-    Write-Output "  - Disabling OneDrive registries..."
+    # Disabling OneDrive registries
     Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Active Setup\Installed Components\{8A69D345-D564-463c-AFF1-A69D9E530F96}'
     Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\Run' 'OneDriveSetup'
     Set-RegistryValue "HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" "REG_DWORD" "1"
 
-    Write-Output "  - Disabling Start Menu Iris recommendation..."
+    # Disabling Start Menu Iris recommendation
     Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'Start_IrisRecommendations' 'REG_DWORD' '0'
     
-    Write-Output "  - Disabling GameDVR and Xbox Game Bar..."
+    # Disabling GameDVR and Xbox Game Bar
     Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\GameDVR' 'AllowGameDVR' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\BcastDVRUserService' 'Start' 'REG_DWORD' '4'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\GameBarPresenceWriter' 'Start' 'REG_DWORD' '4'
     
-    Write-Output "  - Deleting Edge related registries..."
+    # Deleting Edge related registries
     Remove-RegistryValue "HKLM\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge"
     Remove-RegistryValue "HKLM\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge Update"
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\EdgeUpdate' 'DoNotUpdateToEdgeWithChromium' 'REG_DWORD' '1'
 
-    Write-Output "  - Disabling HR, Hibernation..."
+    # Disabling Hibernation
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Control\Power' 'HibernateEnabledDefault' 'REG_DWORD' '0'
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Control\Power' 'HibernateEnabled' 'REG_DWORD' '0'
-    Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' 'DisableSR' 'REG_DWORD' '1'
     
-    Write-Output "  - Deleting Telemetry Scheduled Tasks..."
+    # Deleting Telemetry Scheduled Tasks
     $tasksPath = "$MountDir\Windows\System32\Tasks"
     Remove-Item -Path "$tasksPath\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser" -Force -ErrorAction SilentlyContinue
     Remove-Item -Path "$tasksPath\Microsoft\Windows\Customer Experience Improvement Program" -Recurse -Force -ErrorAction SilentlyContinue
@@ -848,7 +1076,7 @@ Ensure-HiveUnloaded "zSOFTWARE"
 # Phase 11: ResetBase
 Write-Host "`n[11/15] Deep cleaning image components (ResetBase)..." -ForegroundColor Yellow
 
-Write-Host "  - [DISM] Disabling Reserved Storage..." -ForegroundColor DarkGray
+Write-Host "  - Disabling Reserved Storage..." -ForegroundColor DarkGray
 dism.exe /Image:"$MountDir" /Set-ReservedStorageState /State:Disabled /Quiet | Out-Null
 
 reg load HKLM\zSOFTWARE "$MountDir\Windows\System32\config\SOFTWARE" 2>$null | Out-Null
@@ -856,12 +1084,21 @@ Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\SideBySide\Co
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\SideBySide\Configuration' 'SupersededActions' 'REG_DWORD' '1'
 Ensure-HiveUnloaded "zSOFTWARE"
 
-Write-Host "  - Executing DISM Component Cleanup & ResetBase..." -ForegroundColor Cyan
-dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup /ResetBase
+if (-not $UseAutoUpdate) {
+    Write-Host "  - Executing DISM Component Cleanup & ResetBase..." -ForegroundColor Cyan
+    dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup /ResetBase
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [!] Note: ResetBase skipped superseded reset. Image remains valid." -ForegroundColor DarkGray
+    }
+} else {
+    Write-Host "  - Skipping ResetBase because pending Windows Updates were integrated." -ForegroundColor DarkGray
+}
 
 Write-Host "  - Cleaning up temporary servicing caches..." -ForegroundColor DarkGray
-Remove-Item -Path "$MountDir\Windows\WinSxS\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$MountDir\Windows\WinSxS\InstallTemp\*" -Recurse -Force -ErrorAction SilentlyContinue
+if (-not $UseAutoUpdate) {
+    Remove-Item -Path "$MountDir\Windows\WinSxS\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "$MountDir\Windows\WinSxS\InstallTemp\*" -Recurse -Force -ErrorAction SilentlyContinue
+}
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "$MountDir\Windows\SoftwareDistribution\DataStore\*" -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -877,60 +1114,63 @@ if ($UseCustomWallpaper -eq "Y") {
     $WallStdDir  = "$MountDir\Windows\Web\Wallpaper\Windows"
     $ScreenDir   = "$MountDir\Windows\Web\Screen"
 
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-    Invoke-WebRequest -Uri $HomeWallUrl -OutFile $TempHome -UseBasicParsing -ErrorAction Stop
-    if ((Test-Path $TempHome) -and ((Get-Item $TempHome).Length -gt 10240)) {
-        foreach ($Dir in @($Wall4KDir, $WallStdDir)) {
-            if (Test-Path $Dir) {
-                takeown.exe /F "$Dir" /R /A /D Y 2>$null | Out-Null
-                icacls.exe "$Dir" /grant "*S-1-5-32-544:(F)" /T /C /Q 2>$null | Out-Null
-            }
-        }
-
-        if (Test-Path $Wall4KDir) {
-            Get-ChildItem -Path $Wall4KDir -Filter "*.jpg" -File | ForEach-Object {
-                Set-ItemProperty -Path $_.FullName -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
-                Copy-Item -Path $TempHome -Destination $_.FullName -Force
-            }
-            Write-Host "  - Replaced all 4K desktop wallpapers in Web\4K\Wallpaper\Windows" -ForegroundColor Green
-        }
-
-        if (Test-Path $WallStdDir) {
-            foreach ($FileName in @("img0.jpg", "img19.jpg")) {
-                $TargetFile = Join-Path $WallStdDir $FileName
-                if (Test-Path $TargetFile) {
-                    Set-ItemProperty -Path $TargetFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    try {
+        Invoke-WebRequest -Uri $HomeWallUrl -OutFile $TempHome -UseBasicParsing -ErrorAction Stop
+        if ((Test-Path $TempHome) -and ((Get-Item $TempHome).Length -gt 10240)) {
+            foreach ($Dir in @($Wall4KDir, $WallStdDir)) {
+                if (Test-Path $Dir) {
+                    takeown.exe /F "$Dir" /R /A /D Y 2>$null | Out-Null
+                    icacls.exe "$Dir" /grant "*S-1-5-32-544:(F)" /T /C /Q 2>$null | Out-Null
                 }
-                Copy-Item -Path $TempHome -Destination $TargetFile -Force
             }
-            Write-Host "  - Replaced default img0.jpg & img19.jpg in Web\Wallpaper\Windows" -ForegroundColor Green
+
+            if (Test-Path $Wall4KDir) {
+                Get-ChildItem -Path $Wall4KDir -Filter "*.jpg" -File | ForEach-Object {
+                    Set-ItemProperty -Path $_.FullName -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+                    Copy-Item -Path $TempHome -Destination $_.FullName -Force
+                }
+                Write-Host "  - Replaced all 4K desktop wallpapers in Web\4K\Wallpaper\Windows" -ForegroundColor Green
+            }
+
+            if (Test-Path $WallStdDir) {
+                foreach ($FileName in @("img0.jpg", "img19.jpg")) {
+                    $TargetFile = Join-Path $WallStdDir $FileName
+                    if (Test-Path $TargetFile) {
+                        Set-ItemProperty -Path $TargetFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+                    }
+                    Copy-Item -Path $TempHome -Destination $TargetFile -Force
+                }
+                Write-Host "  - Replaced default img0.jpg & img19.jpg in Web\Wallpaper\Windows" -ForegroundColor Green
+            }
+        } else {
+            Write-Host "  [!] NautilusHome.jpg download invalid. Keeping default desktop wallpaper." -ForegroundColor Yellow
         }
-    } else {
-        Write-Host "  [!] NautilusHome.jpg download invalid. Keeping default desktop wallpaper." -ForegroundColor Yellow
+    } catch {
+        Write-Host "  [!] Failed to download desktop wallpaper: $($_.Exception.Message). Keeping Windows defaults." -ForegroundColor Yellow
     }
 
-    Invoke-WebRequest -Uri $LockWallUrl -OutFile $TempLock -UseBasicParsing -ErrorAction Stop
-    if ((Test-Path $TempLock) -and ((Get-Item $TempLock).Length -gt 10240)) {
-        if (Test-Path $ScreenDir) {
-            takeown.exe /F "$ScreenDir" /R /A /D Y 2>$null | Out-Null
-            icacls.exe "$ScreenDir" /grant "*S-1-5-32-544:(F)" /T /C /Q 2>$null | Out-Null
+    try {
+        Invoke-WebRequest -Uri $LockWallUrl -OutFile $TempLock -UseBasicParsing -ErrorAction Stop
+        if ((Test-Path $TempLock) -and ((Get-Item $TempLock).Length -gt 10240)) {
+            if (Test-Path $ScreenDir) {
+                takeown.exe /F "$ScreenDir" /R /A /D Y 2>$null | Out-Null
+                icacls.exe "$ScreenDir" /grant "*S-1-5-32-544:(F)" /T /C /Q 2>$null | Out-Null
 
-            $LockTarget = Join-Path $ScreenDir "img100.jpg"
-            if (Test-Path $LockTarget) {
-                Set-ItemProperty -Path $LockTarget -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+                $LockTarget = Join-Path $ScreenDir "img100.jpg"
+                if (Test-Path $LockTarget) {
+                    Set-ItemProperty -Path $LockTarget -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+                }
+                Copy-Item -Path $TempLock -Destination $LockTarget -Force
+                Write-Host "  - Replaced default Lockscreen (img100.jpg) in Web\Screen" -ForegroundColor Green
             }
-            Copy-Item -Path $TempLock -Destination $LockTarget -Force
-            Write-Host "  - Replaced default Lock Screen (img100.jpg) in Web\Screen" -ForegroundColor Green
+        } else {
+            Write-Host "  [!] NautilusLock.jpg download invalid. Keeping default lock screen." -ForegroundColor Yellow
         }
-    } else {
-        Write-Host "  [!] NautilusLock.jpg download invalid. Keeping default lock screen." -ForegroundColor Yellow
+    } catch {
+        Write-Host "  [!] Failed to download lock screen wallpaper: $($_.Exception.Message). Keeping Windows defaults." -ForegroundColor Yellow
     }
-} catch {
-    Write-Host "  [!] Failed to download wallpapers: $($_.Exception.Message). Keeping Windows defaults." -ForegroundColor Yellow
-}
-
 } else {
     Write-Host "`n[*] Skipping custom wallpapers (keeping Windows defaults)." -ForegroundColor DarkGray
 }
@@ -1025,6 +1265,13 @@ $XmlContent = @"
                 <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
                 <ProtectYourPC>3</ProtectYourPC>
             </OOBE>
+            <FirstLogonCommands>
+                <SynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <Description>Re-register Windows Security UI (SecHealthUI)</Description>
+                    <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$pkgs = Get-AppxPackage -AllUsers *SecHealthUI*; if ($pkgs) { $pkgs | ForEach-Object { Add-AppxPackage -DisableDevelopmentMode -Register ($_.InstallLocation + '\AppXManifest.xml') -ErrorAction SilentlyContinue } } else { $appx = Get-ChildItem 'C:\Windows\System32\SecurityHealth' -Recurse -Filter '*SecHealthUI*.appx' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($appx) { Add-AppxPackage -Path $appx.FullName -ErrorAction SilentlyContinue } }; Start-Service SecurityHealthService -ErrorAction SilentlyContinue"</CommandLine>
+                </SynchronousCommand>
+            </FirstLogonCommands>
             <ConfigureChatAutoInstall>false</ConfigureChatAutoInstall>
         </component>
     </settings>
@@ -1048,7 +1295,6 @@ $XmlContent = @"
             <UserData>
                 <AcceptEula>true</AcceptEula>
                 <ProductKey>
-                    <Key></Key>
                     <WillShowUI>OnError</WillShowUI>
                 </ProductKey>
             </UserData>
@@ -1068,7 +1314,7 @@ if (-not $OscdimgPath) {
     $OscdimgPath = "$Workspace\oscdimg.exe"
     Write-Host "-> oscdimg not found locally, scanning runtime environment and preparing download..." -ForegroundColor Cyan
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
         Invoke-WebRequest -Uri $MicrosoftUrl -OutFile $OscdimgPath -UseBasicParsing
         Write-Host "-> Download completed successfully." -ForegroundColor Green
     } catch {
@@ -1080,6 +1326,11 @@ if (-not $OscdimgPath) {
 }
 
 if (Test-Path $OscdimgPath) {
+    $FinalIsoDir = Split-Path -Path $FinalISO -Parent
+    if (-not [string]::IsNullOrWhiteSpace($FinalIsoDir) -and -not (Test-Path $FinalIsoDir)) {
+        New-Item -ItemType Directory -Force -Path $FinalIsoDir | Out-Null
+    }
+
     Write-Host "Building ISO... (Please wait)" -ForegroundColor Cyan
     $BuildArgs = "-m -o -u2 -udfver102 -bootdata:2#p0,e,bboot\etfsboot.com#pEF,e,befi\microsoft\boot\efisys.bin `"$ExtractDir`" `"$FinalISO`""
 
